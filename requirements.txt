@@ -7,3 +7,4 @@ vsmasktools>=1.3.0
 vsaa>=1.10.0
 vsscale>=2.1.0
 vsdenoise>=2.6.0
+stgpytools>=1.2.0
