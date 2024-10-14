@@ -1,10 +1,12 @@
-__all__ = ["QTGMC", "QTGMCPresets", "QTGMCNoisePresets"]
+__all__ = ["QTGMCPresets", "QTGMCNoisePresets"]
 
 from _collections_abc import dict_items, dict_values, dict_keys
 from typing import TYPE_CHECKING, Any
 
-from stgpytools import CustomIntEnum, inject_self, KwargsT, KwargsNotNone, CustomEnum
+from stgpytools import inject_self, KwargsT, KwargsNotNone, CustomEnum
 from vsdenoise import SearchMode
+
+from vsdeinterlace.qtgmc.enums import EdiMethod, DenoiseMethod, DeintMethod
 
 if TYPE_CHECKING:
 
@@ -12,28 +14,6 @@ if TYPE_CHECKING:
 
 else:
     QTGMCPresetBase = object
-
-
-class EdiMethod:
-    """EEDI method to use within QTGMC"""
-
-    BOB = 0
-    BWDIF = 1
-    NNEDI3 = 2
-
-
-class DenoiseMethod:
-    """Denoiser to use within QTGMC"""
-
-    FFT3DF = 0
-    DFTTEST = 1
-
-
-class DeintMethod:
-    """Deinterlacer to use within QTGMC"""
-
-    BOB = 0
-    GENERATE = 1
 
 
 class QTGMCPreset(QTGMCPresetBase):
@@ -417,7 +397,7 @@ class QTGMCNoisePreset(QTGMCPresetBase):
             denoiser: DenoiseMethod,
             denoise_mc: bool,
             noise_tr: int,
-            noise_deint: DeintMethod | None,
+            noise_deint: DeintMethod,
             stabilize_noise: bool
         ) -> QTGMCPreset: ...
 
@@ -475,7 +455,7 @@ class QTGMCNoisePresets:
         denoiser=DenoiseMethod.FFT3DF,
         denoise_mc=False,
         noise_tr=0,
-        noise_deint=None,
+        noise_deint=DeintMethod.NONE,
         stabilize_noise=False,
     )
 
@@ -483,7 +463,7 @@ class QTGMCNoisePresets:
         denoiser=DenoiseMethod.FFT3DF,
         denoise_mc=False,
         noise_tr=1,
-        noise_deint=None,
+        noise_deint=DeintMethod.NONE,
         stabilize_noise=False,
     )
 
@@ -491,7 +471,7 @@ class QTGMCNoisePresets:
         denoiser=DenoiseMethod.DFTTEST,
         denoise_mc=False,
         noise_tr=1,
-        noise_deint=None,
+        noise_deint=DeintMethod.NONE,
         stabilize_noise=True,
     )
 
@@ -510,7 +490,3 @@ class QTGMCNoisePresets:
         noise_deint=DeintMethod.GENERATE,
         stabilize_noise=True,
     )
-
-
-class QTGMC(CustomIntEnum):
-    pass
