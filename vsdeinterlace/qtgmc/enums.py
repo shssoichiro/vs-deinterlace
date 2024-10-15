@@ -32,9 +32,9 @@ class DeintMethod:
 class InputType:
     """Type of input being processed by QTGMC"""
 
-    INTERLACED = (0,)
+    INTERLACED = 0
     """For interlaced input"""
-    PROG_MODE1 = (1,)
+    PROG_MODE1 = 1
     """For normal progressive input"""
-    PROG_MODE2 = (2,)
+    PROG_MODE2 = 2
     """For badly deinterlaced progressive input"""

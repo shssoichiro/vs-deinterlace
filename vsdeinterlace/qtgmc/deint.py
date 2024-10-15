@@ -1,5 +1,7 @@
 __all__ = ["QTGMC"]
 
+import math
+
 import vapoursynth as vs
 from typing import Optional, Union, Any, Mapping
 
@@ -97,17 +99,19 @@ class NoiseSettings(dict[str, Any]):
     denoiser: DenoiseMethod
     denoise_mc: bool
     noise_tr: int
+    noise_td: int
     sigma: float
     chroma_noise: bool
     show_noise: Union[bool, float]
     grain_restore: float
     noise_restore: float
+    total_restore: float
     noise_deint: DeintMethod
     stabilize_noise: bool
     fft_threads: int
 
 
-class ShutterSettings(dict[str, Any]):
+class MotionBlurSettings(dict[str, Any]):
     shutter_blur: int
     shutter_angle_src: float
     shutter_angle_out: float
@@ -119,12 +123,12 @@ class QTGMC(CustomIntEnum):
     tr0: int
     tr1: int
     tr2: int
+    max_tr: int
     lossless: int
     prog_sad_mask: float
     fps_divisor: int
     border: bool
     precise: bool
-    force_tr: int
     strength: float
     amp: float
     repair: RepairSettings
@@ -133,7 +137,7 @@ class QTGMC(CustomIntEnum):
     me: MotionEstimationSettings
     source_match: Optional[SourceMatchSettings]
     noise: NoiseSettings
-    shutter: ShutterSettings
+    motion_blur: MotionBlurSettings
 
     def __init__(
         self,
@@ -412,7 +416,11 @@ class QTGMC(CustomIntEnum):
         self.tr1 = fallback(tr1, preset.tr1)
         self.tr2 = fallback(tr2, max(preset.tr2, 1) if source_match > 0 else preset.tr2)
         self.precise = fallback(precise, preset.precise)
-        self.prog_sad_mask = fallback(prog_sad_mask, preset.prog_sad_mask)
+        self.prog_sad_mask = (
+            fallback(prog_sad_mask, preset.prog_sad_mask)
+            if self.input_type == InputType.PROG_MODE2
+            else 0.0
+        )
 
         self.repair = RepairSettings(
             repair0=fallback(repair0, preset.repair0),
@@ -432,6 +440,8 @@ class QTGMC(CustomIntEnum):
             eedi3_args=eedi3_args,
         )
 
+        # Sharpness defaults. Sharpness default is always 1.0 (0.2 with source-match),
+        # but adjusted to give roughly same sharpness for all settings
         sharp_limit_rad = fallback(sharp_limit_rad, preset.sharp_limit_rad)
         sharp_mode = (
             0
@@ -473,21 +483,25 @@ class QTGMC(CustomIntEnum):
             ),
         )
 
+        block_size = fallback(block_size, preset.block_size)
         self.me = MotionEstimationSettings(
             search_clip_pp=fallback(search_clip_pp, preset.search_clip_pp),
             sub_pel=fallback(sub_pel, preset.sub_pel),
             sub_pel_interp=sub_pel_interp,
-            block_size=fallback(block_size, preset.block_size),
+            block_size=block_size,
             overlap=fallback(overlap, preset.overlap),
             search=fallback(search, preset.search),
             search_param=fallback(search_param, preset.search_param),
             pel_search=fallback(pel_search, preset.pel_search),
             chroma_motion=fallback(chroma_motion, preset.chroma_motion),
             true_motion=true_motion,
-            coherence=coherence,
-            coherence_sad=coherence_sad,
-            penalty_new=penalty_new,
-            penalty_level=penalty_level,
+            coherence=fallback(
+                coherence,
+                (1000 if true_motion else 100) * block_size * block_size // 64,
+            ),
+            coherence_sad=fallback(coherence_sad, 1200 if true_motion else 400),
+            penalty_new=fallback(penalty_new, 50 if true_motion else 25),
+            penalty_level=fallback(penalty_level, 1 if true_motion else 0),
             global_motion=global_motion,
             dct=dct,
             th_sad1=th_sad1,
@@ -498,25 +512,86 @@ class QTGMC(CustomIntEnum):
             refine_motion=refine_motion,
         )
 
+        if (
+            ez_denoise is not None
+            and ez_denoise > 0
+            and ez_keep_grain is not None
+            and ez_keep_grain > 0
+        ):
+            raise vs.Error(
+                "QTGMC: ez_denoise and ez_keep_grain cannot be used together"
+            )
+        noise_tr = fallback(noise_tr, noise_preset.noise_tr)
+        stabilize_noise = fallback(stabilize_noise, noise_preset.stabilize_noise)
+        if noise_process is None:
+            if ez_denoise is not None and ez_denoise > 0:
+                noise_process = 1
+            elif (ez_keep_grain is not None and ez_keep_grain > 0) or preset.preset in [
+                QTGMCPresets.PLACEBO.preset,
+                QTGMCPresets.VERY_SLOW.preset,
+            ]:
+                noise_process = 2
+            else:
+                noise_process = 0
+        if grain_restore is None:
+            if ez_denoise is not None and ez_denoise > 0:
+                grain_restore = 0.0
+            elif ez_keep_grain is not None and ez_keep_grain > 0:
+                grain_restore = 0.3 * math.sqrt(ez_keep_grain)
+            else:
+                grain_restore = [0.0, 0.7, 0.3][noise_process]
+        if noise_restore is None:
+            if ez_denoise is not None and ez_denoise > 0:
+                noise_restore = 0.0
+            elif ez_keep_grain is not None and ez_keep_grain > 0:
+                noise_restore = 0.1 * math.sqrt(ez_keep_grain)
+            else:
+                noise_restore = [0.0, 0.3, 0.1][noise_process]
+        if sigma is None:
+            if ez_denoise is not None and ez_denoise > 0:
+                sigma = ez_denoise
+            elif ez_keep_grain is not None and ez_keep_grain > 0:
+                sigma = 4.0 * ez_keep_grain
+            else:
+                sigma = 2.0
+        if isinstance(show_noise, bool):
+            show_noise = 10.0 if show_noise else 0.0
+        if show_noise > 0:
+            noise_process = 2
+            noise_restore = 1.0
+        if noise_process <= 0:
+            noise_tr = 0
+            grain_restore = 0.0
+            noise_restore = 0.0
+        total_restore = grain_restore + noise_restore
+        if total_restore <= 0:
+            stabilize_noise = False
         self.noise = NoiseSettings(
             noise_process=noise_process,
             ez_denoise=ez_denoise,
             ez_keep_grain=ez_keep_grain,
             denoiser=fallback(denoiser, noise_preset.denoiser),
             denoise_mc=fallback(denoise_mc, noise_preset.denoise_mc),
-            noise_tr=fallback(noise_tr, noise_preset.noise_tr),
+            noise_tr=noise_tr,
+            noise_td=[1, 3, 5][noise_tr],
             noise_deint=fallback(noise_deint, noise_preset.noise_deint),
-            stabilize_noise=fallback(stabilize_noise, noise_preset.stabilize_noise),
+            stabilize_noise=stabilize_noise,
             sigma=sigma,
             chroma_noise=chroma_noise,
             show_noise=show_noise,
             grain_restore=grain_restore,
             noise_restore=noise_restore,
+            total_restore=total_restore,
             fft_threads=fft_threads,
         )
 
-        self.shutter = ShutterSettings(
-            shutter_blur=shutter_blur,
+        self.motion_blur = MotionBlurSettings(
+            # Disable if motion blur output is same as input
+            shutter_blur=(
+                0
+                if shutter_angle_out * fps_divisor == shutter_angle_src
+                else shutter_blur
+            ),
             shutter_angle_src=shutter_angle_src,
             shutter_angle_out=shutter_angle_out,
             shutter_blur_limit=shutter_blur_limit,
@@ -549,6 +624,7 @@ class QTGMC(CustomIntEnum):
             match_edi_qual2=1,
             match_tr1=self.tr1,
             match_tr2=match_tr2,
+            match_enhance=match_enhance,
         )
         if source_match > 0:
             # Basic source-match presets
@@ -562,8 +638,25 @@ class QTGMC(CustomIntEnum):
                 # Force bwdif for Ultra Fast basic source match
                 self.interp.edi_mode = EdiMethod.BWDIF
 
-        # TODO: havsfunc.py:1092
-        pass
+        self.max_tr = max(
+            self.sharp.sharp_limit_rad if self.sharp.temporal_sharp_limit else 0,
+            self.source_match.match_tr2,
+            self.tr1,
+            self.tr2,
+            self.noise.noise_tr,
+        )
+        if (
+            self.prog_sad_mask > 0
+            or self.noise.stabilize_noise
+            or self.motion_blur.shutter_blur > 0
+        ) and self.max_tr < 1:
+            self.max_tr = 1
+        self.max_tr = max(force_tr, self.max_tr)
+
+        self.lossless = lossless
+        self.border = border
+        self.strength = strength
+        self.amp = amp
 
     def process(
         self,
@@ -595,6 +688,7 @@ class QTGMC(CustomIntEnum):
         neutral = 1 << (bit_depth - 1)
 
         sharp_overshoot = scale_value(self.sharp.sharp_overshoot, 8, bit_depth)
+        noise_center = scale_value(128.5, 8, bit_depth)
 
-        # TODO
+        # TODO: havsfunc.py:1087
         pass
