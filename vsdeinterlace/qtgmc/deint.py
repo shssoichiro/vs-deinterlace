@@ -3,8 +3,9 @@ __all__ = ["QTGMC"]
 import vapoursynth as vs
 from typing import Optional, Union, Any, Mapping
 
-from stgpytools import CustomIntEnum
+from stgpytools import CustomIntEnum, fallback
 from vsdenoise import SearchMode
+from vstools import FieldBased, get_depth, scale_value
 
 from vsdeinterlace.qtgmc.presets import (
     QTGMCPreset,
@@ -15,454 +16,122 @@ from vsdeinterlace.qtgmc.presets import (
 from vsdeinterlace.qtgmc.enums import DeintMethod, DenoiseMethod, EdiMethod, InputType
 
 
-class RepairSettings:
+class RepairSettings(dict[str, Any]):
     repair0: int
-    """Repair motion search clip (0=off): repair unwanted blur after temporal smooth TR0."""
-
     repair1: int
-    """Repair initial output clip (0=off): repair unwanted blur after temporal smooth TR1."""
-
     repair2: int
-    """Repair final output clip (0=off): unwanted blur after temporal smooth TR2 (will also repair TR1 blur if Rep1 not used)."""
-
     rep_chroma: bool
-    """Whether the repair modes affect chroma"""
 
 
-class InterpolateSettings:
+class InterpolateSettings(dict[str, Any]):
     edi_mode: EdiMethod
-    """Interpolation method"""
-
     nn_size: int
-    """
-    Area around each pixel used as predictor for NNEDI3.
-    A larger area is slower with better quality, read the NNEDI3 docs to see the area choices.
-    Note: area sizes are not in increasing order (i.e. increased value doesn't always mean increased quality).
-    """
-
     num_neurons: int
-    """Controls number of neurons in NNEDI3, larger = slower and better quality but improvements are small."""
-
     edi_qual: int
-    """Quality setting for NNEDI3. Higher values for better quality - but improvements are marginal."""
-
     edi_max_dist: int
-    """Spatial search distance for finding connecting edges in EEDI3."""
-
     chroma_edi: EdiMethod
-    """Interpolation method used for chroma."""
-
-    edi_clip: vs.VideoNode
-    """Provide externally created interpolated clip rather than use one of the above modes."""
-
     nnedi3_args: Mapping[str, Any]
-    """Additional arguments to pass to NNEDI3."""
-
     eedi3_args: Mapping[str, Any]
-    """Additional arguments to pass to EEDI3."""
 
 
-class SharpenSettings:
+class SharpenSettings(dict[str, Any]):
     sharpness: float
-    """How much to resharpen the temporally blurred clip (default is always 1.0 unlike original TGMC)."""
-
     sharp_mode: int
-    """
-    Resharpening mode.
-        0 = none
-        1 = difference from 3x3 blur kernel
-        2 = vertical max/min average + 3x3 kernel
-    """
     sharp_limit_mode: int
-    """
-    Sharpness limiting.
-        0 = off
-        [1 = spatial, 2 = temporal]: before final temporal smooth
-        [3 = spatial, 4 = temporal]: after final temporal smooth
-    """
-
     sharp_limit_rad: int
-    """
-    Temporal or spatial radius used with sharpness limiting (depends on `sharp_limit_mode`).
-    Temporal radius can only be 0, 1 or 3.
-    """
-
     sharp_overshoot: int
-    """
-    Amount of overshoot allowed with temporal sharpness limiting (`sharp_limit_mode`=2,4),
-    i.e. allow some oversharpening.
-    """
-
     sharp_thin: float
-    """
-    How much to thin down 1-pixel wide lines that have been widened
-    due to interpolation into neighboring field lines.
-    """
-
     sharp_back_blend: int
-    """
-    Back blend (blurred) difference between pre & post sharpened clip (minor fidelity improvement).
-        0 = off
-        1 = before (1st) sharpness limiting
-        2 = after (1st) sharpness limiting
-        3 = both
-    """
+    spatial_sharp_limit: bool
+    temporal_sharp_limit: bool
+    sharp_mul: float
+    sharp_adj: float
 
 
-class MotionEstimationSettings:
+class MotionEstimationSettings(dict[str, Any]):
     search_clip_pp: int
-    """
-    Pre-filtering for motion search clip.
-        0 = none
-        1 = simple blur
-        2 = Gauss blur
-        3 = Gauss blur + edge soften
-    """
-
     sub_pel: int
-    """
-    Sub-pixel accuracy for motion analysis.
-        1 = 1 pixel
-        2 = 1/2 pixel
-        4 = 1/4 pixel
-    """
-
     sub_pel_interp: int
-    """
-    Interpolation used for sub-pixel motion analysis.
-        0 = bilinear (soft)
-        1 = bicubic (sharper)
-        2 = Weiner (sharpest)
-    """
-
     block_size: int
-    """Size of blocks (square) that are matched during motion analysis."""
-
     overlap: int
-    """
-    How much to overlap motion analysis blocks (requires more blocks,
-    but essential to smooth block edges in motion compensation).
-    """
-
     search: SearchMode
-    """Search method used for matching motion blocks."""
-
     search_param: int
-    """Parameter for search method chosen. For hexagon search it is the search range."""
-
     pel_search: int
-    """Search parameter (as above) for the finest sub-pixel level (see `sub_pel`)."""
-
     chroma_motion: bool
-    """
-    Whether to consider chroma when analyzing motion.
-    Setting to false gives good speed-up, but may very occasionally make incorrect motion decision.
-    """
-
     true_motion: bool
-    """Whether to use the 'truemotion' defaults from MAnalyse (see MVTools2 documentation)."""
-
     coherence: int
-    """
-    Motion vector field coherence - how much the motion analysis
-    favors similar motion vectors for neighboring blocks.
-    Should be scaled by BlockSize*BlockSize/64.
-    """
-
     coherence_sad: int
-    """
-    How much to reduce need for vector coherence (i.e. `coherence` above)
-    if prediction of motion vector from neighbors is poor,
-    typically in areas of complex motion.
-    This value is scaled in MVTools (unlike `coherence`).
-    """
-
     penalty_new: int
-    """
-    Penalty for choosing a new motion vector for a block over an existing one -
-    avoids choosing new vectors for minor gain.
-    """
-
     penalty_level: int
-    """
-    Mode for scaling lambda across different sub-pixel levels - see MVTools2 documentation for choices.
-    """
-
     global_motion: bool
-    """Whether to estimate camera motion to assist in selecting block motion vectors."""
-
     dct: int
-    """
-    Modes to use DCT (frequency analysis) or SATD as part of the block matching process -
-    see MVTools2 documentation for choices.
-    """
-
     th_sad1: int
-    """
-    SAD threshold for block match on shimmer-removing temporal smooth (TR1).
-    Increase to reduce bob-shimmer more (may smear/blur).
-    """
-
     th_sad2: int
-    """
-    SAD threshold for block match on final denoising temporal smooth (TR2).
-    Increase to strengthen final smooth (may smear/blur).
-    """
-
     th_scd1: int
-    """Scene change detection parameter 1 - see MVTools documentation."""
-
     th_scd2: int
-    """Scene change detection parameter 2 - see MVTools documentation."""
-
     fast_ma: bool
-    """Use 8-bit for faster motion analysis when using high bit depth input."""
-
-    extended_search: bool
-    """Use wider search range for hex and umh search method."""
-
     refine_motion: bool
-    """
-    Refines and recalculates motion data of previously estimated motion vectors
-    with new parameters set (e.g. lesser block size).
-    The two-stage method may be also useful for more stable (robust) motion estimation.
-    """
 
 
-class SourceMatchSettings:
+class SourceMatchSettings(dict[str, Any]):
     source_match: int
-    """
-    0 = source-matching off (standard algorithm)
-    1 = basic source-match
-    2 = refined match
-    3 = twice refined match
-    """
-
     match_edi: EdiMethod
-    """
-    Override default interpolation method for basic source-match.
-    Default method is same as main `edi_mode` setting (usually NNEDI3).
-    Only need to override if using slow method for main interpolation (e.g. EEDI3)
-    and want a faster method for source-match.
-    """
-
+    match_nn_size: int
+    match_num_neurons: int
+    match_edi_max_dist: int
+    match_edi_qual: int
     match_edi2: EdiMethod
-    """
-    Override interpolation method for refined source-match.
-    Can be a good idea to pick match_edi2="Bob" for speed.
-    """
-
+    match_nn_size2: int
+    match_num_neurons2: int
+    match_edi_max_dist2: int
+    match_edi_qual2: int
+    match_tr1: int
     match_tr2: int
-    """
-    Temporal radius for refined source-matching.
-    2=smoothness, 1=speed/sharper, 0=not recommended.
-    Differences are very marginal.
-    Basic source-match doesn't need this setting as its temporal radius must match TR1 core setting
-    (i.e. there is no MatchTR1).
-    """
-
     match_enhance: float
-    """
-    Enhance the detail found by source-match modes 2 & 3.
-    A slight cheat - will enhance noise if set too strong. Best set < 1.0.
-    """
 
 
-class NoiseSettings:
+class NoiseSettings(dict[str, Any]):
     noise_process: int
-    """
-    0 = disable
-    1 = denoise source & optionally restore some noise back at end of script [use for stronger denoising]
-    2 = identify noise only & optionally restore some after QTGMC smoothing [for grain retention / light denoising]
-    """
-
     ez_denoise: float
-    """
-    Automatic setting to denoise source. Set > 0.0 to enable.
-    Higher values denoise more. Can use ShowNoise to help choose value.
-    """
-
     ez_keep_grain: float
-    """
-    Automatic setting to retain source grain/detail. Set > 0.0 to enable.
-    Higher values retain more grain. A good starting point = 1.0.
-    """
-
     denoiser: DenoiseMethod
-    """
-    Select denoiser to use for noise bypass / denoising.
-    """
-
-    fft_threads: int
-    """Number of threads to use if using "fft3dfilter" for Denoiser."""
-
     denoise_mc: bool
-    """
-    Whether to provide a motion-compensated clip to the denoiser for better noise vs detail detection
-    (will be a little slower).
-    """
-
     noise_tr: int
-    """
-    Temporal radius used when analyzing clip for noise extraction.
-    Higher values better identify noise vs detail but are slower.
-    """
-
     sigma: float
-    """
-    Amount of noise known to be in the source, sensible values vary by source and denoiser, so experiment.
-    Use ShowNoise to help.
-    """
-
     chroma_noise: bool
-    """
-    When processing noise (NoiseProcess > 0), whether to process chroma noise or not
-    (luma noise is always processed).
-    """
-
     show_noise: Union[bool, float]
-    """
-    Display extracted and "deinterlaced" noise rather than normal output.
-    Set to true or false, or set a value (around 4 to 16) to specify
-    contrast for displayed noise. Visualising noise helps to determine
-    suitable value for Sigma or EZDenoise - want to see noise and noisy detail,
-    but not too much clean structure or edges - fairly subjective.
-    """
-
     grain_restore: float
-    """
-    How much removed noise/grain to restore before final temporal smooth.
-    Retain "stable" grain and some detail (effect depends on TR2).
-    """
-
     noise_restore: float
-    """How much removed noise/grain to restore after final temporal smooth. Retains any kind of noise."""
-
     noise_deint: DeintMethod
-    """
-    When noise is taken from interlaced source, how to 'deinterlace' it before restoring.
-    "Bob" & "DoubleWeave" are fast but with minor issues: "Bob" is coarse and "Doubleweave" lags by one frame.
-    "Generate" is a high quality mode that generates fresh noise lines, but it is slower.
-    """
-
     stabilize_noise: bool
-    """
-    Use motion compensation to limit shimmering and strengthen detail within the restored noise.
-    Recommended for "Generate" mode.
-    """
+    fft_threads: int
 
 
-class ShutterSettings:
+class ShutterSettings(dict[str, Any]):
     shutter_blur: int
-    """
-    0=Off, 1=Enable, 2,3=Higher precisions (slower).
-    Higher precisions reduce blur "bleeding" into static areas a little.
-    """
-
     shutter_angle_src: float
-    """
-    Shutter angle used in source. If necessary, estimate from motion blur seen in a single frame.
-    0=pin-sharp, 360=fully blurred from frame to frame.
-    """
-
     shutter_angle_out: float
-    """
-    Shutter angle to simulate in output. Extreme values may be rejected (depends on other settings).
-    Cannot reduce motion blur already in the source.
-    """
-
     shutter_blur_limit: int
-    """
-    Limit motion blur where motion lower than given value.
-    Increase to reduce blur "bleeding". 0=Off. Sensible range around 2-12.
-    """
 
 
 class QTGMC(CustomIntEnum):
     input_type: InputType
-    """Type of input being processed by QTGMC"""
-
-    tff: bool
-    """True if source material is top-field first, False if bottom-field first"""
-
     tr0: int
-    """
-    Temporal binomial smoothing radius used to create motion search clip.
-    In general: 2=quality, 1=speed, 0=don't use.
-    """
-
     tr1: int
-    """
-    Temporal binomial smoothing radius used on interpolated clip for initial output.
-    In general: 2=quality, 1=speed, 0=don't use.
-    """
-
     tr2: int
-    """
-    Temporal linear smoothing radius used for final stabilization / denoising.
-    Increase for smoother output.
-    """
-
     lossless: int
-    """
-    Puts exact source fields into result & cleans any artefacts.
-    0=off, 1=after final temporal smooth, 2=before resharpening.
-    Adds some extra detail but:
-    mode 1 gets shimmer / minor combing,
-    mode 2 is more stable/tweakable but not exactly lossless.
-    """
-
     prog_sad_mask: float
-    """
-    Only applies to progressive input types.
-    If ProgSADMask > 0.0 then blend interlaced and progressive input modes based on block motion SAD.
-    Higher values help recover more detail, but repair less artefacts.
-    Reasonable range about 2.0 to 20.0, or 0.0 for no blending.
-    """
-
     fps_divisor: int
-    """
-    1=Double-rate output, 2=Single-rate output.
-    Higher values can be used too (e.g. 60fps & FPSDivisor=3 gives 20fps output).
-    """
-
     border: bool
-    """
-    Pad a little vertically while processing (doesn't affect output size) -
-    set true you see flickering on the very top or bottom line of the output.
-    If you have wider edge effects than that, you should crop afterwards instead.
-    """
-
     precise: bool
-    """Set to false to use faster algorithms with *very* slight imprecision in places."""
-
-    show_settings: bool
-    """Display all the current parameter values - useful to find preset defaults."""
-
     force_tr: int
-    """
-    Ensure globally exposed motion vectors are calculated to this radius even if not needed by QTGMC.
-    """
-
     strength: float
-    """
-    With this parameter you control the strength of the brightening of the prefilter clip for motion analysis.
-    This is good when problems with dark areas arise.
-    """
-
     amp: float
-    """
-    Use this together with Str (active when Str is different from 1.0).
-    This defines the amplitude of the brightening in the luma range,
-    for example by using 1.0 all the luma range will be used and the brightening
-    will find its peak at luma value 128 in the original.
-    """
-
     repair: RepairSettings
     interp: InterpolateSettings
     sharp: SharpenSettings
     me: MotionEstimationSettings
-    source_match: SourceMatchSettings
+    source_match: Optional[SourceMatchSettings]
     noise: NoiseSettings
     shutter: ShutterSettings
 
@@ -473,21 +142,19 @@ class QTGMC(CustomIntEnum):
         match_preset2: Optional[QTGMCPreset] = None,
         noise_preset: QTGMCNoisePreset = QTGMCNoisePresets.FAST,
         input_type: InputType = InputType.INTERLACED,
-        tff: Optional[bool] = None,
         tr0: Optional[int] = None,
         tr1: Optional[int] = None,
         tr2: Optional[int] = None,
         repair0: Optional[int] = None,
         repair1: int = 0,
         repair2: Optional[int] = None,
-        edi_mode: Optional[EdiMethod] = None,
         rep_chroma: bool = True,
+        edi_mode: Optional[EdiMethod] = None,
         nn_size: Optional[int] = None,
         num_neurons: Optional[int] = None,
         edi_qual: int = 1,
         edi_max_dist: Optional[int] = None,
         chroma_edi: Optional[EdiMethod] = None,
-        edi_clip: Optional[vs.VideoNode] = None,
         sharpness: Optional[float] = None,
         sharp_mode: Optional[int] = None,
         sharp_limit_mode: Optional[int] = None,
@@ -543,14 +210,10 @@ class QTGMC(CustomIntEnum):
         shutter_blur_limit: int = 4,
         border: bool = False,
         precise: Optional[bool] = None,
-        show_settings: bool = False,
-        global_names: str = "QTGMC",
-        prev_globals: str = "Replace",
         force_tr: int = 0,
         strength: float = 2.0,
         amp: float = 0.0625,
         fast_ma: bool = False,
-        extended_search: bool = False,
         refine_motion: bool = False,
         nnedi3_args: Mapping[str, Any] = {},
         eedi3_args: Mapping[str, Any] = {},
@@ -558,5 +221,380 @@ class QTGMC(CustomIntEnum):
         """
         Initializes the QTGMC processor.
         Any custom parameters specified will override the values from the preset.
+
+        :param preset:              Speed/quality preset.
+                                    Default is Slower.
+        :param match_preset:        Speed/quality preset for basic source-match processing.
+                                    Ideal choice is the same as main preset,
+                                    but can choose a faster setting (but not a slower setting).
+                                    Default is same as main `preset`.
+        :param match_preset2:       Speed/quality preset for refined source-match processing.
+                                    Default is 2 steps faster than `match_preset`.
+                                    Faster settings are usually sufficient but can use slower settings
+                                    if you get extra aliasing in this mode.
+        :param noise_preset:        Speed/quality preset for noise processing
+                                    Default is Fast.
+        :param input_type:          Type of input being processed, whether interlaced or progressive.
+        :param tr0:                 Temporal binomial smoothing radius used to create motion search clip.
+                                    In general: 2=quality, 1=speed, 0=don't use.
+        :param tr1:                 Temporal binomial smoothing radius used on interpolated clip for initial output.
+                                    In general: 2=quality, 1=speed, 0=don't use.
+        :param tr2:                 Temporal linear smoothing radius used for final stabilization / denoising.
+                                    Increase for smoother output.
+        :param repair0:             Repair motion search clip (0=off): repair unwanted blur after temporal smooth `tr0`.
+        :param repair1:             Repair initial output clip (0=off): repair unwanted blur after temporal smooth `tr1`.
+        :param repair2:             Repair final output clip (0=off): unwanted blur after temporal smooth `tr2`
+                                    (will also repair `tr1` blur if `repair1` not used).
+        :param rep_chroma:          Whether the repair modes affect chroma.
+        :param edi_mode:            Interpolation method to use.
+        :param nn_size:             Area around each pixel used as predictor for NNEDI3.
+                                    A larger area is slower with better quality,
+                                    read the NNEDI3 docs to see the area choices.
+                                    Note: area sizes are not in increasing order
+                                    (i.e. increased value doesn't always mean increased quality).
+        :param num_neurons:         Controls number of neurons in NNEDI3,
+                                    larger = slower and better quality but improvements are small.
+        :param edi_qual:            Quality setting for NNEDI3. Higher values for better quality,
+                                    but improvements are marginal.
+        :param edi_max_dist:        Spatial search distance for finding connecting edges in EEDI3.
+        :param chroma_edi:          Interpolation method used for chroma.
+                                    If set to None, will use same mode as luma.
+        :param sharpness:           How much to resharpen the temporally blurred clip.
+        :param sharp_mode:          Resharpening mode.
+                                    0 = none
+                                    1 = difference from 3x3 blur kernel
+                                    2 = vertical max/min average + 3x3 kernel
+        :param sharp_limit_mode:     Sharpness limiting.
+                                    0 = off
+                                    [1 = spatial, 2 = temporal]: before final temporal smooth
+                                    [3 = spatial, 4 = temporal]: after final temporal smooth
+        :param sharp_limit_rad:     Temporal or spatial radius used with sharpness limiting (depends on `sharp_limit_mode`).
+                                    Temporal radius can only be 0, 1 or 3.
+        :param sharp_overshoot:     Amount of overshoot allowed with temporal sharpness limiting (`sharp_limit_mode`=2,4),
+                                    i.e. allow some oversharpening.
+        :param sharp_thin:          How much to thin down 1-pixel wide lines that have been widened
+                                    due to interpolation into neighboring field lines.
+        :param sharp_back_blend:     Back blend (blurred) difference between pre & post sharpened clip (minor fidelity improvement).
+                                    0 = off
+                                    1 = before (1st) sharpness limiting
+                                    2 = after (1st) sharpness limiting
+                                    3 = both
+        :param search_clip_pp:      Pre-filtering for motion search clip.
+                                    0 = none
+                                    1 = simple blur
+                                    2 = Gauss blur
+                                    3 = Gauss blur + edge soften
+        :param sub_pel:             Sub-pixel accuracy for motion analysis.
+                                    1 = 1 pixel
+                                    2 = 1/2 pixel
+                                    4 = 1/4 pixel
+        :param sub_pel_interp:      Interpolation used for sub-pixel motion analysis.
+                                    0 = bilinear (soft)
+                                    1 = bicubic (sharper)
+                                    2 = Weiner (sharpest)
+        :param block_size:          Size of blocks (square) that are matched during motion analysis.
+        :param overlap:             How much to overlap motion analysis blocks (requires more blocks,
+                                    but essential to smooth block edges in motion compensation).
+        :param search:              Search method used for matching motion blocks.
+        :param search_param:        Parameter for search method chosen. For hexagon search it is the search range.
+        :param pel_search:          Search parameter (as above) for the finest sub-pixel level (see `sub_pel`).
+        :param chroma_motion:       Whether to consider chroma when analyzing motion.
+                                    Setting to False gives good speed-up,
+                                    but may very occasionally make incorrect motion decision.
+        :param true_motion:         Whether to use the 'truemotion' defaults from MAnalyse (see MVTools2 documentation).
+        :param coherence:           Motion vector field coherence - how much the motion analysis
+                                    favors similar motion vectors for neighboring blocks.
+                                    Should be scaled by BlockSize*BlockSize/64.
+        :param coherence_sad:       How much to reduce need for vector coherence (i.e. `coherence` above)
+                                    if prediction of motion vector from neighbors is poor,
+                                    typically in areas of complex motion.
+                                    This value is scaled in MVTools (unlike `coherence`).
+        :param penalty_new:         Penalty for choosing a new motion vector for a block over an existing one -
+                                    avoids choosing new vectors for minor gain.
+        :param penalty_level:       Mode for scaling lambda across different sub-pixel levels - see MVTools2 documentation for choices.
+        :param global_motion:       Whether to estimate camera motion to assist in selecting block motion vectors.
+        :param dct:                 Modes to use DCT (frequency analysis) or SATD as part of the block matching process -
+                                    see MVTools2 documentation for choices.
+        :param th_sad1:             SAD threshold for block match on shimmer-removing temporal smooth (TR1).
+                                    Increase to reduce bob-shimmer more (may smear/blur).
+        :param th_sad2:             SAD threshold for block match on final denoising temporal smooth (TR2).
+                                    Increase to strengthen final smooth (may smear/blur).
+        :param th_scd1:             Scene change detection parameter 1 - see MVTools documentation.
+        :param th_scd2:             Scene change detection parameter 2 - see MVTools documentation.
+        :param source_match:        Source matching mode.
+                                    0 = source-matching off (standard algorithm)
+                                    1 = basic source-match
+                                    2 = refined match
+                                    3 = twice refined match
+        :param match_edi:           Override default interpolation method for basic source-match.
+                                    Default method is same as main `edi_mode` setting (usually NNEDI3).
+                                    Only need to override if using slow method for main interpolation (e.g. EEDI3)
+                                    and want a faster method for source-match.
+        :param match_edi2:          Override interpolation method for refined source-match.
+                                    Can be a good idea to pick match_edi2="Bob" for speed.
+        :param match_tr2:           Temporal radius for refined source-matching.
+                                    2=smoothness, 1=speed/sharper, 0=not recommended.
+                                    Differences are very marginal.
+                                    Basic source-match doesn't need this setting as its temporal radius must match TR1 core setting
+                                    (i.e. there is no MatchTR1).
+        :param match_enhance:       Enhance the detail found by source-match modes 2 & 3.
+                                    A slight cheat - will enhance noise if set too strong. Best set < 1.0.
+        :param lossless:            Puts exact source fields into result & cleans any artefacts.
+                                    0=off, 1=after final temporal smooth, 2=before resharpening.
+                                    Adds some extra detail but:
+                                    mode 1 gets shimmer / minor combing,
+                                    mode 2 is more stable/tweakable but not exactly lossless.
+        :param noise_process:       0 = disable
+                                    1 = denoise source & optionally restore some noise back at end of script [use for stronger denoising]
+                                    2 = identify noise only & optionally restore some after QTGMC smoothing [for grain retention / light denoising]
+        :param ez_denoise:          Automatic setting to denoise source. Set > 0.0 to enable.
+                                    Higher values denoise more. Can use ShowNoise to help choose value.
+        :param ez_keep_grain:       Automatic setting to retain source grain/detail. Set > 0.0 to enable.
+                                    Higher values retain more grain. A good starting point = 1.0.
+        :param denoiser:            Select denoiser to use for noise bypass / denoising.
+        :param fft_threads:         Number of threads to use if using "fft3dfilter" for Denoiser.
+        :param denoise_mc:          Whether to provide a motion-compensated clip to the denoiser for better noise vs detail detection
+                                    (will be a little slower).
+        :param noise_tr:            Temporal radius used when analyzing clip for noise extraction.
+                                    Higher values better identify noise vs detail but are slower.
+        :param sigma:               Amount of noise known to be in the source, sensible values vary by source and denoiser, so experiment.
+                                    Use ShowNoise to help.
+        :param chroma_noise:        When processing noise (NoiseProcess > 0), whether to process chroma noise or not
+                                    (luma noise is always processed).
+        :param show_noise:          Display extracted and "deinterlaced" noise rather than normal output.
+                                    Set to true or false, or set a value (around 4 to 16) to specify
+                                    contrast for displayed noise. Visualising noise helps to determine
+                                    suitable value for Sigma or EZDenoise - want to see noise and noisy detail,
+                                    but not too much clean structure or edges - fairly subjective.
+        :param grain_restore:       How much removed noise/grain to restore before final temporal smooth.
+                                    Retain "stable" grain and some detail (effect depends on TR2).
+        :param noise_restore:       How much removed noise/grain to restore after final temporal smooth. Retains any kind of noise.
+        :param noise_deint:         When noise is taken from interlaced source, how to 'deinterlace' it before restoring.
+                                    "Bob" & "DoubleWeave" are fast but with minor issues: "Bob" is coarse and "Doubleweave" lags by one frame.
+                                    "Generate" is a high quality mode that generates fresh noise lines, but it is slower.
+        :param stabilize_noise:     Use motion compensation to limit shimmering and strengthen detail within the restored noise.
+                                    Recommended for "Generate" mode.
+        :param prog_sad_mask:       Only applies to progressive input types.
+                                    If ProgSADMask > 0.0 then blend interlaced and progressive input modes based on block motion SAD.
+                                    Higher values help recover more detail, but repair less artefacts.
+                                    Reasonable range about 2.0 to 20.0, or 0.0 for no blending.
+        :param fps_divisor:         1=Double-rate output, 2=Single-rate output.
+                                    Higher values can be used too (e.g. 60fps & FPSDivisor=3 gives 20fps output).
+        :param shutter_blur:        0=Off, 1=Enable, 2,3=Higher precisions (slower).
+                                    Higher precisions reduce blur "bleeding" into static areas a little.
+        :param shutter_angle_src:   Shutter angle used in source. If necessary, estimate from motion blur seen in a single frame.
+                                    0=pin-sharp, 360=fully blurred from frame to frame.
+        :param shutter_angle_out:   Shutter angle to simulate in output. Extreme values may be rejected (depends on other settings).
+                                    Cannot reduce motion blur already in the source.
+        :param shutter_blur_limit:  Limit motion blur where motion lower than given value.
+                                    Increase to reduce blur "bleeding". 0=Off. Sensible range around 2-12.
+        :param border:              Pad a little vertically while processing (doesn't affect output size) -
+                                    set true you see flickering on the very top or bottom line of the output.
+                                    If you have wider edge effects than that, you should crop afterwards instead.
+        :param precise:             Set to false to use faster algorithms with *very* slight imprecision in places.
+        :param force_tr:            Ensure globally exposed motion vectors are calculated to this radius even if not needed by QTGMC.
+        :param strength:            With this parameter you control the strength of the brightening of the prefilter clip for motion analysis.
+                                    This is good when problems with dark areas arise.
+        :param amp:                 Use this together with Str (active when Str is different from 1.0).
+                                    This defines the amplitude of the brightening in the luma range,
+                                    for example by using 1.0 all the luma range will be used and the brightening
+                                    will find its peak at luma value 128 in the original.
+        :param fast_ma:             Use 8-bit for faster motion analysis when using high bit depth input.
+        :param refine_motion:       Refines and recalculates motion data of previously estimated motion vectors
+                                    with new parameters set (e.g. lesser block size).
+                                    The two-stage method may be also useful for more stable (robust) motion estimation.
+        :param nnedi3_args:         Additional arguments to pass to NNEDI3.
+        :param eedi3_args:          Additional arguments to pass to EEDI3.
         """
+
+        self.input_type = input_type
+        self.tr0 = fallback(tr0, preset.tr0)
+        self.tr1 = fallback(tr1, preset.tr1)
+        self.tr2 = fallback(tr2, max(preset.tr2, 1) if source_match > 0 else preset.tr2)
+        self.precise = fallback(precise, preset.precise)
+        self.prog_sad_mask = fallback(prog_sad_mask, preset.prog_sad_mask)
+
+        self.repair = RepairSettings(
+            repair0=fallback(repair0, preset.repair0),
+            repair2=fallback(repair2, preset.repair2),
+            repair1=repair1,
+            rep_chroma=rep_chroma,
+        )
+
+        self.interp = InterpolateSettings(
+            edi_mode=fallback(edi_mode, preset.edi_mode),
+            nn_size=fallback(nn_size, preset.nn_size),
+            num_neurons=fallback(num_neurons, preset.num_neurons),
+            edi_max_dist=fallback(edi_max_dist, preset.edi_max_dist),
+            edi_qual=edi_qual,
+            chroma_edi=chroma_edi,
+            nnedi3_args=nnedi3_args,
+            eedi3_args=eedi3_args,
+        )
+
+        sharp_limit_rad = fallback(sharp_limit_rad, preset.sharp_limit_rad)
+        sharp_mode = (
+            0
+            if sharpness is not None and sharpness <= 0
+            else fallback(sharp_mode, preset.sharp_mode)
+        )
+        sharp_limit_mode = (
+            0
+            if sharp_limit_rad <= 0
+            else fallback(
+                sharp_limit_mode, 0 if source_match > 0 else preset.sharp_limit_mode
+            )
+        )
+        sharpness = fallback(
+            sharpness, 0.0 if sharp_mode <= 0 else 0.2 if source_match > 0 else 1.0
+        )
+        spatial_sharp_limit = (sharp_limit_mode in [1, 3],)
+        temporal_sharp_limit = (sharp_limit_mode in [2, 4],)
+        sharp_mul = 2 if temporal_sharp_limit else 1.5 if spatial_sharp_limit else 1
+        self.sharp = SharpenSettings(
+            sharp_mode=sharp_mode,
+            sharp_limit_rad=sharp_limit_rad,
+            sharp_back_blend=(
+                0
+                if sharp_mode <= 0
+                else fallback(sharp_back_blend, preset.sharp_back_blend)
+            ),
+            sharp_limit_mode=sharp_limit_mode,
+            sharpness=sharpness,
+            sharp_overshoot=sharp_overshoot,
+            sharp_thin=sharp_thin,
+            spatial_sharp_limit=spatial_sharp_limit,
+            temporal_sharp_limit=temporal_sharp_limit,
+            sharp_mul=sharp_mul,
+            sharp_adj=sharpness
+            * (
+                sharp_mul * (0.2 + self.tr1 * 0.15 + self.tr2 * 0.25)
+                + (0.1 if sharp_mode == 1 else 0)
+            ),
+        )
+
+        self.me = MotionEstimationSettings(
+            search_clip_pp=fallback(search_clip_pp, preset.search_clip_pp),
+            sub_pel=fallback(sub_pel, preset.sub_pel),
+            sub_pel_interp=sub_pel_interp,
+            block_size=fallback(block_size, preset.block_size),
+            overlap=fallback(overlap, preset.overlap),
+            search=fallback(search, preset.search),
+            search_param=fallback(search_param, preset.search_param),
+            pel_search=fallback(pel_search, preset.pel_search),
+            chroma_motion=fallback(chroma_motion, preset.chroma_motion),
+            true_motion=true_motion,
+            coherence=coherence,
+            coherence_sad=coherence_sad,
+            penalty_new=penalty_new,
+            penalty_level=penalty_level,
+            global_motion=global_motion,
+            dct=dct,
+            th_sad1=th_sad1,
+            th_sad2=th_sad2,
+            th_scd1=th_scd1,
+            th_scd2=th_scd2,
+            fast_ma=fast_ma,
+            refine_motion=refine_motion,
+        )
+
+        self.noise = NoiseSettings(
+            noise_process=noise_process,
+            ez_denoise=ez_denoise,
+            ez_keep_grain=ez_keep_grain,
+            denoiser=fallback(denoiser, noise_preset.denoiser),
+            denoise_mc=fallback(denoise_mc, noise_preset.denoise_mc),
+            noise_tr=fallback(noise_tr, noise_preset.noise_tr),
+            noise_deint=fallback(noise_deint, noise_preset.noise_deint),
+            stabilize_noise=fallback(stabilize_noise, noise_preset.stabilize_noise),
+            sigma=sigma,
+            chroma_noise=chroma_noise,
+            show_noise=show_noise,
+            grain_restore=grain_restore,
+            noise_restore=noise_restore,
+            fft_threads=fft_threads,
+        )
+
+        self.shutter = ShutterSettings(
+            shutter_blur=shutter_blur,
+            shutter_angle_src=shutter_angle_src,
+            shutter_angle_out=shutter_angle_out,
+            shutter_blur_limit=shutter_blur_limit,
+        )
+
+        if match_preset is None or match_preset.preset > QTGMCPresets.ULTRA_FAST.preset:
+            match_preset = QTGMCPreset.from_int(
+                min(preset.preset, QTGMCPresets.ULTRA_FAST.preset)
+            )
+        if match_preset2 is None:
+            match_preset2 = QTGMCPreset.from_int(
+                min(match_preset.preset + 2, QTGMCPresets.ULTRA_FAST.preset)
+            )
+        if source_match > 0 and match_preset.preset < preset.preset:
+            raise vs.Error(
+                "QTGMC: Match Preset cannot use a slower setting than Preset"
+            )
+
+        self.source_match = SourceMatchSettings(
+            source_match=source_match,
+            match_edi=edi_mode,
+            match_nn_size=self.interp.nn_size,
+            match_num_neurons=self.interp.num_neurons,
+            match_edi_max_dist=self.interp.edi_max_dist,
+            match_edi_qual=self.interp.edi_qual,
+            match_edi2=fallback(match_edi2, match_preset.edi_mode),
+            match_nn_size2=match_preset.nn_size,
+            match_num_neurons2=match_preset.num_neurons,
+            match_edi_max_dist2=match_preset.edi_max_dist,
+            match_edi_qual2=1,
+            match_tr1=self.tr1,
+            match_tr2=match_tr2,
+        )
+        if source_match > 0:
+            # Basic source-match presets
+            self.interp.nn_size = match_preset.nn_size
+            self.interp.num_neurons = match_preset.num_neurons
+            self.interp.edi_max_dist = match_preset.edi_max_dist
+            self.interp.edi_qual = 1
+            if match_edi is not None:
+                self.interp.edi_mode = match_edi
+            elif match_preset.preset == QTGMCPresets.ULTRA_FAST.preset:
+                # Force bwdif for Ultra Fast basic source match
+                self.interp.edi_mode = EdiMethod.BWDIF
+
+        # TODO: havsfunc.py:1092
+        pass
+
+    def process(
+        self,
+        clip: vs.VideoNode,
+        edi_clip: Optional[vs.VideoNode] = None,
+        tff: Optional[bool] = None,
+    ) -> vs.VideoNode:
+        """
+        Process a given `clip` using QTGMC to deinterlace and/or fix shimmering and combing.
+
+        :param clip:     Clip to process
+        :param edi_clip: Externally created interpolated clip to use rather than QTGMC's interpolation.
+        :param tff:      True if source material is top-field first, False if bottom-field first.
+                         None will attempt to infer from source clip.
+        """
+
+        if not isinstance(clip, vs.VideoNode):
+            raise vs.Error("QTGMC: input is not a clip")
+
+        if edi_clip is not None and not isinstance(edi_clip, vs.VideoNode):
+            raise vs.Error("QTGMC: edi_clip is not a clip")
+
+        tff = self.tff
+        if self.input_type != InputType.PROG_MODE1 and tff is None:
+            tff = FieldBased.from_video(clip, True).is_tff
+
+        is_gray = clip.format.color_family == vs.GRAY
+        bit_depth = get_depth(clip)
+        neutral = 1 << (bit_depth - 1)
+
+        sharp_overshoot = scale_value(self.sharp.sharp_overshoot, 8, bit_depth)
+
+        # TODO
         pass

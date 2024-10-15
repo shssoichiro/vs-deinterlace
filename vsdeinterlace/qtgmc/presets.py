@@ -8,98 +8,41 @@ from vsdenoise import SearchMode
 
 from vsdeinterlace.qtgmc.enums import EdiMethod, DenoiseMethod, DeintMethod
 
-if TYPE_CHECKING:
 
-    class QTGMCPresetBase(dict[str, Any]): ...
-
-else:
-    QTGMCPresetBase = object
-
-
-class QTGMCPreset(QTGMCPresetBase):
+class QTGMCPreset(dict[str, Any]):
     """Base class for properties defined in a QTGMC preset"""
 
-    if TYPE_CHECKING:
-
-        def __call__(
-            self,
-            *,
-            tr0: int,
-            tr1: int,
-            tr2_x: int,
-            repair0: int,
-            repair2: int,
-            edi_mode: EdiMethod,
-            nn_size: int,
-            num_neurons: int,
-            edi_max_dist: int,
-            sharp_mode: int,
-            sharp_limit_mode_x: int,
-            sharp_limit_rad: int,
-            sharp_back_blend: int,
-            search_clip_pp: int,
-            sub_pel: int,
-            block_size: int,
-            overlap: int,
-            search: SearchMode,
-            search_param: int,
-            pel_search: int,
-            chroma_motion: bool,
-            precise: bool,
-            prog_sad_mask: float
-        ) -> QTGMCPreset: ...
-
-    else:
-
-        def __call__(self, **kwargs: Any) -> QTGMCPreset:
-            return QTGMCPreset(**(dict(**self) | kwargs))
-
-    def _get_dict(self) -> KwargsT:
-        return KwargsNotNone(
-            **{
-                key: value.__get__(self) if isinstance(value, property) else value
-                for key, value in (
-                    self._value_ if isinstance(self, CustomEnum) else self
-                ).__dict__.items()
-            }
-        )
-
-    def __getitem__(self, key: str) -> Any:
-        return self._get_dict()[key]
-
-    def __class_getitem__(cls, key: str) -> Any:
-        return cls()[key]
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._get_dict().get(key, default)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._get_dict()
-
-    def copy(self) -> QTGMCPreset:
-        return QTGMCPreset(**self._get_dict())
-
-    def keys(self) -> dict_keys[str, Any]:
-        return self._get_dict().keys()
-
-    def values(self) -> dict_values[str, Any]:
-        return self._get_dict().values()
-
-    def items(self) -> dict_items[str, Any]:
-        return self._get_dict().items()
-
-    def __eq__(self, other: Any) -> bool:
-        return False
-
-    @inject_self
-    def as_dict(self) -> KwargsT:
-        return KwargsT(**self._get_dict())
+    preset: int
+    tr0: int
+    tr1: int
+    tr2: int
+    repair0: int
+    repair2: int
+    edi_mode: EdiMethod
+    nn_size: int
+    num_neurons: int
+    edi_max_dist: int
+    sharp_mode: int
+    sharp_limit_mode: int
+    sharp_limit_rad: int
+    sharp_back_blend: int
+    search_clip_pp: int
+    sub_pel: int
+    block_size: int
+    overlap: int
+    search: SearchMode
+    search_param: int
+    pel_search: int
+    chroma_motion: bool
+    precise: bool
+    prog_sad_mask: float
 
 
 class QTGMCPresets:
     """Presets for QTGMC speed/quality tradeoff"""
 
     DRAFT = QTGMCPreset(
+        preset=10,
         tr0=0,
         tr1=1,
         tr2_x=0,
@@ -126,6 +69,7 @@ class QTGMCPresets:
     )
 
     ULTRA_FAST = QTGMCPreset(
+        preset=9,
         tr0=1,
         tr1=1,
         tr2_x=0,
@@ -152,6 +96,7 @@ class QTGMCPresets:
     )
 
     SUPER_FAST = QTGMCPreset(
+        preset=8,
         tr0=1,
         tr1=1,
         tr2_x=0,
@@ -178,6 +123,7 @@ class QTGMCPresets:
     )
 
     VERY_FAST = QTGMCPreset(
+        preset=7,
         tr0=1,
         tr1=1,
         tr2_x=0,
@@ -204,6 +150,7 @@ class QTGMCPresets:
     )
 
     FASTER = QTGMCPreset(
+        preset=6,
         tr0=1,
         tr1=1,
         tr2_x=0,
@@ -230,6 +177,7 @@ class QTGMCPresets:
     )
 
     FAST = QTGMCPreset(
+        preset=5,
         tr0=2,
         tr1=1,
         tr2_x=0,
@@ -256,6 +204,7 @@ class QTGMCPresets:
     )
 
     MEDIUM = QTGMCPreset(
+        preset=4,
         tr0=2,
         tr1=1,
         tr2_x=1,
@@ -282,6 +231,7 @@ class QTGMCPresets:
     )
 
     SLOW = QTGMCPreset(
+        preset=3,
         tr0=2,
         tr1=1,
         tr2_x=1,
@@ -308,6 +258,7 @@ class QTGMCPresets:
     )
 
     SLOWER = QTGMCPreset(
+        preset=2,
         tr0=2,
         tr1=2,
         tr2_x=1,
@@ -334,6 +285,7 @@ class QTGMCPresets:
     )
 
     VERY_SLOW = QTGMCPreset(
+        preset=1,
         tr0=2,
         tr1=2,
         tr2_x=2,
@@ -360,6 +312,7 @@ class QTGMCPresets:
     )
 
     PLACEBO = QTGMCPreset(
+        preset=0,
         tr0=2,
         tr1=2,
         tr2_x=3,
@@ -386,72 +339,22 @@ class QTGMCPresets:
     )
 
 
-class QTGMCNoisePreset(QTGMCPresetBase):
+class QTGMCNoisePreset(dict[str, Any]):
     """Base class for properties defined in a QTGMC noise preset"""
 
-    if TYPE_CHECKING:
-
-        def __call__(
-            self,
-            *,
-            denoiser: DenoiseMethod,
-            denoise_mc: bool,
-            noise_tr: int,
-            noise_deint: DeintMethod,
-            stabilize_noise: bool
-        ) -> QTGMCPreset: ...
-
-    else:
-
-        def __call__(self, **kwargs: Any) -> QTGMCPreset:
-            return QTGMCPreset(**(dict(**self) | kwargs))
-
-    def _get_dict(self) -> KwargsT:
-        return KwargsNotNone(
-            **{
-                key: value.__get__(self) if isinstance(value, property) else value
-                for key, value in (
-                    self._value_ if isinstance(self, CustomEnum) else self
-                ).__dict__.items()
-            }
-        )
-
-    def __getitem__(self, key: str) -> Any:
-        return self._get_dict()[key]
-
-    def __class_getitem__(cls, key: str) -> Any:
-        return cls()[key]
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._get_dict().get(key, default)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._get_dict()
-
-    def copy(self) -> QTGMCPreset:
-        return QTGMCPreset(**self._get_dict())
-
-    def keys(self) -> dict_keys[str, Any]:
-        return self._get_dict().keys()
-
-    def values(self) -> dict_values[str, Any]:
-        return self._get_dict().values()
-
-    def items(self) -> dict_items[str, Any]:
-        return self._get_dict().items()
-
-    def __eq__(self, other: Any) -> bool:
-        return False
-
-    @inject_self
-    def as_dict(self) -> KwargsT:
-        return KwargsT(**self._get_dict())
+    preset: int
+    denoiser: DenoiseMethod
+    denoise_mc: bool
+    noise_tr: int
+    noise_deint: DeintMethod
+    stabilize_noise: bool
 
 
 class QTGMCNoisePresets:
     """Presets for QTGMC denoising speed/quality tradeoff"""
 
     FASTER = QTGMCNoisePreset(
+        preset=4,
         denoiser=DenoiseMethod.FFT3DF,
         denoise_mc=False,
         noise_tr=0,
@@ -460,6 +363,7 @@ class QTGMCNoisePresets:
     )
 
     FAST = QTGMCNoisePreset(
+        preset=3,
         denoiser=DenoiseMethod.FFT3DF,
         denoise_mc=False,
         noise_tr=1,
@@ -468,6 +372,7 @@ class QTGMCNoisePresets:
     )
 
     MEDIUM = QTGMCNoisePreset(
+        preset=2,
         denoiser=DenoiseMethod.DFTTEST,
         denoise_mc=False,
         noise_tr=1,
@@ -476,6 +381,7 @@ class QTGMCNoisePresets:
     )
 
     SLOW = QTGMCNoisePreset(
+        preset=1,
         denoiser=DenoiseMethod.DFTTEST,
         denoise_mc=True,
         noise_tr=1,
@@ -484,6 +390,7 @@ class QTGMCNoisePresets:
     )
 
     SLOWER = QTGMCNoisePreset(
+        preset=0,
         denoiser=DenoiseMethod.DFTTEST,
         denoise_mc=True,
         noise_tr=2,
