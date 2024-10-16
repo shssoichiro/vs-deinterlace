@@ -6,8 +6,16 @@ import vapoursynth as vs
 from typing import Optional, Union, Any, Mapping
 
 from stgpytools import CustomIntEnum, fallback
-from vsdenoise import SearchMode
-from vstools import FieldBased, get_depth, scale_value
+from vsdenoise import SearchMode, prefilter_to_full_range
+from vsrgtools import gauss_blur
+from vstools import (
+    FieldBased,
+    get_depth,
+    scale_value,
+    check_variable,
+    depth,
+    DitherType,
+)
 
 from vsdeinterlace.qtgmc.presets import (
     QTGMCPreset,
@@ -16,6 +24,8 @@ from vsdeinterlace.qtgmc.presets import (
     QTGMCNoisePresets,
 )
 from vsdeinterlace.qtgmc.enums import DeintMethod, DenoiseMethod, EdiMethod, InputType
+
+core = vs.core
 
 
 class RepairSettings(dict[str, Any]):
@@ -138,6 +148,10 @@ class QTGMC(CustomIntEnum):
     source_match: Optional[SourceMatchSettings]
     noise: NoiseSettings
     motion_blur: MotionBlurSettings
+
+    matrix: list[int] = [1, 2, 1, 2, 4, 2, 1, 2, 1]
+
+    search_clip: vs.VideoNode
 
     def __init__(
         self,
@@ -661,16 +675,18 @@ class QTGMC(CustomIntEnum):
     def process(
         self,
         clip: vs.VideoNode,
-        edi_clip: Optional[vs.VideoNode] = None,
         tff: Optional[bool] = None,
+        edi_clip: Optional[vs.VideoNode] = None,
+        search_clip: Optional[vs.VideoNode] = None,
     ) -> vs.VideoNode:
         """
         Process a given `clip` using QTGMC to deinterlace and/or fix shimmering and combing.
 
-        :param clip:     Clip to process
-        :param edi_clip: Externally created interpolated clip to use rather than QTGMC's interpolation.
-        :param tff:      True if source material is top-field first, False if bottom-field first.
-                         None will attempt to infer from source clip.
+        :param clip:        Clip to process
+        :param tff:         True if source material is top-field first, False if bottom-field first.
+                            None will attempt to infer from source clip.
+        :param edi_clip:    Externally created interpolated clip to use rather than QTGMC's interpolation.
+        :param search_clip: Filtered clip used for motion analysis
         """
 
         if not isinstance(clip, vs.VideoNode):
@@ -679,7 +695,6 @@ class QTGMC(CustomIntEnum):
         if edi_clip is not None and not isinstance(edi_clip, vs.VideoNode):
             raise vs.Error("QTGMC: edi_clip is not a clip")
 
-        tff = self.tff
         if self.input_type != InputType.PROG_MODE1 and tff is None:
             tff = FieldBased.from_video(clip, True).is_tff
 
@@ -690,5 +705,155 @@ class QTGMC(CustomIntEnum):
         sharp_overshoot = scale_value(self.sharp.sharp_overshoot, 8, bit_depth)
         noise_center = scale_value(128.5, 8, bit_depth)
 
-        # TODO: havsfunc.py:1087
+        width = clip.width
+        height = clip.height
+
+        # Pad vertically during processing (to prevent artefacts at top & bottom edges)
+        if self.border:
+            height += 8
+            clip = clip.resize.Point(width, height, src_top=-4, src_height=height)
+
+        hpad = vpad = self.me.block_size
+
+        # --- Motion Analysis
+
+        # Bob the input as a starting point for the motion search clip
+        if self.input_type == InputType.INTERLACED:
+            bobbed = clip.resize.Bob(tff=tff, filter_param_a=0, filter_param_b=0.5)
+        elif self.input_type == InputType.PROG_MODE1:
+            bobbed = clip
+        else:
+            bobbed = clip.std.Convolution(matrix=[1, 2, 1], mode="v")
+
+        cm_planes = [0, 1, 2] if self.me.chroma_motion and not is_gray else [0]
+
+        if isinstance(search_clip, vs.VideoNode):
+            self.search_clip = search_clip
+        else:
+            self.search_clip = self._build_search_clip(
+                bobbed, cm_planes, bit_depth, is_gray
+            )
+
+        # TODO: havsfunc.py:1181
         pass
+
+    def _build_search_clip(
+        self, bobbed: vs.VideoNode, cm_planes: list[int], bit_depth: int, is_gray: bool
+    ) -> vs.VideoNode:
+        # The bobbed clip will shimmer due to being derived from alternating fields.
+        # Temporally smooth over the neighboring frames using a binomial kernel.
+        # Binomial kernels give equal weight to even and odd frames and hence average away the shimmer.
+        # The two kernels used are [1 2 1] and [1 4 6 4 1] for radius 1 and 2.
+        # These kernels are approximately Gaussian kernels, which work well as a prefilter
+        # before motion analysis (hence the original name for this script)
+        #
+        # Create linear weightings of neighbors first
+        bobbed = scdetect(bobbed, 28 / 255)
+        # -2    -1    0     1     2
+        if self.tr0 > 0:
+            # 0.00  0.33  0.33  0.33  0.00
+            ts1 = bobbed.misc.AverageFrames([1] * 3, scenechange=True, planes=cm_planes)
+        if self.tr0 > 1:
+            # 0.20  0.20  0.20  0.20  0.20
+            ts2 = bobbed.misc.AverageFrames([1] * 5, scenechange=True, planes=cm_planes)
+
+        # Combine linear weightings to give binomial weightings - TR0=0: (1), TR0=1: (1:2:1), TR0=2: (1:4:6:4:1)
+        if self.tr0 <= 0:
+            binomial0 = bobbed
+        elif self.tr0 == 1:
+            binomial0 = core.std.Merge(
+                ts1,
+                bobbed,
+                weight=0.25 if self.me.chroma_motion or is_gray else [0.25, 0],
+            )
+        else:
+            binomial0 = core.std.Merge(
+                core.std.Merge(
+                    ts1,
+                    ts2,
+                    weight=0.357 if self.me.chroma_motion or is_gray else [0.357, 0],
+                ),
+                bobbed,
+                weight=0.125 if self.me.chroma_motion or is_gray else [0.125, 0],
+            )
+
+        # Remove areas of difference between temporal blurred motion search clip and bob
+        # that are not due to bob-shimmer - removes general motion blur
+        if self.repair.repair0 > 0:
+            repair0 = self._keep_only_bob_shimmer_fixes(
+                binomial0, bobbed, self.repair.rep_chroma and self.me.chroma_motion
+            )
+        else:
+            repair0 = binomial0
+
+        if self.me.search_clip_pp == 1:
+            spatial_blur = (
+                repair0.resize.Bilinear(w // 2, h // 2)
+                .std.Convolution(matrix=self.matrix, planes=cm_planes)
+                .resize.Bilinear(w, h)
+            )
+        elif self.me.search_clip_pp >= 2:
+            spatial_blur = gauss_blur(
+                repair0.std.Convolution(matrix=self.matrix, planes=cm_planes), 1.75
+            )
+            spatial_blur = core.std.Merge(
+                spatial_blur,
+                repair0,
+                weight=0.1 if self.me.chroma_motion or is_gray else [0.1, 0],
+            )
+
+        if self.me.search_clip_pp <= 0:
+            search_clip = repair0
+        elif self.me.search_clip_pp < 3:
+            search_clip = spatial_blur
+        else:
+            expr = "x {i3} + y < x {i3} + x {i3} - y > x {i3} - y ? ?".format(
+                i3=scale_value(3, 8, bit_depth)
+            )
+            tweaked = core.std.Expr(
+                [repair0, bobbed],
+                expr=expr if self.me.chroma_motion or is_gray else [expr, ""],
+            )
+            expr = "x {i7} + y < x {i2} + x {i7} - y > x {i2} - x 51 * y 49 * + 100 / ? ?".format(
+                i7=scale_value(7, 8, bit_depth), i2=scale_value(2, 8, bit_depth)
+            )
+            search_clip = core.std.Expr(
+                [spatial_blur, tweaked],
+                expr=expr if self.me.chroma_motion or is_gray else [expr, ""],
+            )
+        search_clip = prefilter_to_full_range(search_clip, self.strength, cm_planes)
+        if bit_depth > 8 and self.me.fast_ma:
+            search_clip = depth(search_clip, 8, dither_type=DitherType.NONE)
+
+        return search_clip
+
+    def _keep_only_bob_shimmer_fixes(
+        self,
+        clip: vs.VideoNode,
+        ref: vs.VideoNode,
+        repair: int = 1,
+        chroma: bool = True,
+    ) -> vs.VideoNode:
+        # TODO
+        pass
+
+
+# TODO: Is there a function for this in JET?
+def scdetect(clip: vs.VideoNode, threshold: float = 0.1) -> vs.VideoNode:
+    def _copy_property(_n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:
+        fout = f[0].copy()
+        fout.props["_SceneChangePrev"] = f[1].props["_SceneChangePrev"]
+        fout.props["_SceneChangeNext"] = f[1].props["_SceneChangeNext"]
+        return fout
+
+    assert check_variable(clip, scdetect)
+
+    sc = clip
+    if clip.format.color_family == vs.RGB:
+        sc = clip.resize.Point(format=vs.GRAY8, matrix_s="709")
+
+    sc = sc.misc.SCDetect(threshold)
+    if clip.format.color_family == vs.RGB:
+        sc = clip.std.ModifyFrame([clip, sc], _copy_property)
+
+    return sc
