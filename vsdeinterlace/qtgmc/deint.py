@@ -151,7 +151,14 @@ class QTGMC(CustomIntEnum):
 
     matrix: list[int] = [1, 2, 1, 2, 4, 2, 1, 2, 1]
 
-    search_clip: vs.VideoNode
+    search_clip: Optional[vs.VideoNode]
+    search_super: Optional[vs.VideoNode]
+    b_vec1: Optional[vs.VideoNode]
+    f_vec1: Optional[vs.VideoNode]
+    b_vec2: Optional[vs.VideoNode]
+    f_vec2: Optional[vs.VideoNode]
+    b_vec3: Optional[vs.VideoNode]
+    f_vec3: Optional[vs.VideoNode]
 
     def __init__(
         self,
@@ -731,14 +738,110 @@ class QTGMC(CustomIntEnum):
             self.search_clip = search_clip
         else:
             self.search_clip = self._build_search_clip(
-                bobbed, cm_planes, bit_depth, is_gray
+                bobbed, cm_planes, width, height, bit_depth, is_gray
             )
 
-        # TODO: havsfunc.py:1181
+        super_args = dict(pel=self.me.sub_pel, hpad=hpad, vpad=vpad)
+        analyse_args = dict(
+            blksize=self.me.block_size,
+            overlap=self.me.overlap,
+            search=self.me.search,
+            searchparam=self.me.search_param,
+            pelsearch=self.me.pel_search,
+            truemotion=self.me.true_motion,
+            lambda_=self.me.coherence,
+            lsad=self.me.coherence_sad,
+            pnew=self.me.penalty_new,
+            plevel=self.me.penalty_level,
+            global_=self.me.global_motion,
+            dct=self.me.dct,
+            chroma=self.me.chroma_motion,
+        )
+        recalculate_args = dict(
+            thsad=self.me.th_sad1 // 2,
+            blksize=max(self.me.block_size // 2, 4),
+            search=self.me.search,
+            searchparam=self.me.search_param,
+            chroma=self.me.chroma_motion,
+            truemotion=self.me.true_motion,
+            pnew=self.me.penalty_new,
+            overlap=max(self.me.overlap // 2, 2),
+            dct=self.me.dct,
+        )
+
+        if self.max_tr > 0:
+            if not isinstance(self.search_super, vs.VideoNode):
+                self.search_super = self.search_clip.mv.Super(
+                    sharp=self.me.sub_pel_interp,
+                    chroma=self.me.chroma_motion,
+                    **super_args
+                )
+            if not isinstance(self.b_vec1, vs.VideoNode):
+                self.b_vec1 = self.search_super.mv.Analyse(
+                    isb=True, delta=1, **analyse_args
+                )
+                if self.me.refine_motion:
+                    self.b_vec1 = core.mv.Recalculate(
+                        self.search_super, self.b_vec1, **recalculate_args
+                    )
+            if not isinstance(self.f_vec1, vs.VideoNode):
+                self.f_vec1 = self.search_super.mv.Analyse(
+                    isb=False, delta=1, **analyse_args
+                )
+                if self.me.refine_motion:
+                    self.f_vec1 = core.mv.Recalculate(
+                        self.search_super, self.f_vec1, **recalculate_args
+                    )
+        if self.max_tr > 1:
+            if not isinstance(self.b_vec2, vs.VideoNode):
+                self.b_vec2 = self.search_super.mv.Analyse(
+                    isb=True, delta=2, **analyse_args
+                )
+                if self.me.refine_motion:
+                    self.b_vec2 = core.mv.Recalculate(
+                        self.search_super, self.b_vec2, **recalculate_args
+                    )
+            if not isinstance(self.f_vec2, vs.VideoNode):
+                self.f_vec2 = self.search_super.mv.Analyse(
+                    isb=False, delta=2, **analyse_args
+                )
+                if self.me.refine_motion:
+                    self.f_vec2 = core.mv.Recalculate(
+                        self.search_super, self.f_vec2, **recalculate_args
+                    )
+        if self.max_tr > 2:
+            if not isinstance(self.b_vec3, vs.VideoNode):
+                self.b_vec3 = self.search_super.mv.Analyse(
+                    isb=True, delta=3, **analyse_args
+                )
+                if self.me.refine_motion:
+                    self.b_vec3 = core.mv.Recalculate(
+                        self.search_super, self.b_vec3, **recalculate_args
+                    )
+            if not isinstance(self.f_vec3, vs.VideoNode):
+                self.f_vec3 = self.search_super.mv.Analyse(
+                    isb=False, delta=3, **analyse_args
+                )
+                if self.me.refine_motion:
+                    self.f_vec3 = core.mv.Recalculate(
+                        self.search_super, self.f_vec3, **recalculate_args
+                    )
+
+        # --- Noise Processing
+
+        # Expand fields to full frame size before extracting noise
+        # (allows use of motion vectors which are frame-sized)
+        # TODO: havsfunc.py:1253
         pass
 
     def _build_search_clip(
-        self, bobbed: vs.VideoNode, cm_planes: list[int], bit_depth: int, is_gray: bool
+        self,
+        bobbed: vs.VideoNode,
+        cm_planes: list[int],
+        width: int,
+        height: int,
+        bit_depth: int,
+        is_gray: bool,
     ) -> vs.VideoNode:
         # The bobbed clip will shimmer due to being derived from alternating fields.
         # Temporally smooth over the neighboring frames using a binomial kernel.
@@ -788,9 +891,9 @@ class QTGMC(CustomIntEnum):
 
         if self.me.search_clip_pp == 1:
             spatial_blur = (
-                repair0.resize.Bilinear(w // 2, h // 2)
+                repair0.resize.Bilinear(width // 2, height // 2)
                 .std.Convolution(matrix=self.matrix, planes=cm_planes)
-                .resize.Bilinear(w, h)
+                .resize.Bilinear(width, height)
             )
         elif self.me.search_clip_pp >= 2:
             spatial_blur = gauss_blur(

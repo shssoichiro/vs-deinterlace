@@ -1,11 +1,8 @@
-__all__ = ["QTGMCPresets", "QTGMCNoisePresets"]
+__all__ = ["QTGMCPreset", "QTGMCPresets", "QTGMCNoisePreset", "QTGMCNoisePresets"]
 
-from _collections_abc import dict_items, dict_values, dict_keys
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from stgpytools import inject_self, KwargsT, KwargsNotNone, CustomEnum
 from vsdenoise import SearchMode
-
 from vsdeinterlace.qtgmc.enums import EdiMethod, DenoiseMethod, DeintMethod
 
 
