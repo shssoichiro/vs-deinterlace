@@ -34,7 +34,7 @@ class InputType:
 
     INTERLACED = 0
     """For interlaced input"""
-    PROG_MODE1 = 1
-    """For normal progressive input"""
-    PROG_MODE2 = 2
-    """For badly deinterlaced progressive input"""
+    PROGRESSIVE = 1
+    """For normal progressive input, useful for deshimmering"""
+    PROGRESSIVE_WITH_COMBING = 2
+    """For badly deinterlaced progressive input that has visible combing"""

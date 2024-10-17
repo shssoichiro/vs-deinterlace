@@ -7,6 +7,7 @@ from typing import Optional, Union, Any, Mapping
 
 from stgpytools import CustomIntEnum, fallback
 from vsdenoise import SearchMode, prefilter_to_full_range, nl_means, BM3D
+from vsexprtools import complexpr_available, norm_expr
 from vsrgtools import gauss_blur
 from vstools import (
     FieldBased,
@@ -15,6 +16,9 @@ from vstools import (
     check_variable,
     depth,
     DitherType,
+    check_ref_clip,
+    normalize_planes,
+    PlanesT,
 )
 
 from vsdeinterlace.qtgmc.presets import (
@@ -149,7 +153,7 @@ class QTGMC(CustomIntEnum):
     noise: NoiseSettings
     motion_blur: MotionBlurSettings
 
-    matrix: list[int] = [1, 2, 1, 2, 4, 2, 1, 2, 1]
+    _matrix: list[int] = [1, 2, 1, 2, 4, 2, 1, 2, 1]
 
     search_clip: Optional[vs.VideoNode]
     search_super: Optional[vs.VideoNode]
@@ -439,7 +443,7 @@ class QTGMC(CustomIntEnum):
         self.precise = fallback(precise, preset.precise)
         self.prog_sad_mask = (
             fallback(prog_sad_mask, preset.prog_sad_mask)
-            if self.input_type == InputType.PROG_MODE2
+            if self.input_type == InputType.PROGRESSIVE_WITH_COMBING
             else 0.0
         )
 
@@ -702,7 +706,7 @@ class QTGMC(CustomIntEnum):
         if edi_clip is not None and not isinstance(edi_clip, vs.VideoNode):
             raise vs.Error("QTGMC: edi_clip is not a clip")
 
-        if self.input_type != InputType.PROG_MODE1 and tff is None:
+        if self.input_type != InputType.PROGRESSIVE and tff is None:
             tff = FieldBased.from_video(clip, True).is_tff
 
         is_gray = clip.format.color_family == vs.GRAY
@@ -727,7 +731,7 @@ class QTGMC(CustomIntEnum):
         # Bob the input as a starting point for the motion search clip
         if self.input_type == InputType.INTERLACED:
             bobbed = clip.resize.Bob(tff=tff, filter_param_a=0, filter_param_b=0.5)
-        elif self.input_type == InputType.PROG_MODE1:
+        elif self.input_type == InputType.PROGRESSIVE:
             bobbed = clip
         else:
             bobbed = clip.std.Convolution(matrix=[1, 2, 1], mode="v")
@@ -1016,7 +1020,7 @@ class QTGMC(CustomIntEnum):
         # Support badly deinterlaced progressive content -
         # drop half the fields and reweave to get 1/2fps interlaced stream
         # appropriate for QTGMC processing
-        if self.input_type == InputType.PROG_MODE2:
+        if self.input_type == InputType.PROGRESSIVE_WITH_COMBING:
             edi_input = (
                 inner_clip.std.SeparateFields(tff=tff)
                 .std.SelectEvery(cycle=4, offsets=[0, 3])
@@ -1037,13 +1041,18 @@ class QTGMC(CustomIntEnum):
             edi1 = self._interpolate(
                 edi_input,
                 bobbed,
+                self.interp.edi_mode,
+                self.interp.nn_size,
+                self.interp.num_neurons,
+                self.interp.edi_qual,
+                self.interp.edi_max_dist,
                 tff,
             )
 
         # InputType=2,3: use motion mask to blend luma
         # between original clip & reweaved clip based on ProgSADMask setting.
         # Use chroma from original clip in any case
-        if self.input_type != InputType.PROG_MODE2:
+        if self.input_type != InputType.PROGRESSIVE_WITH_COMBING:
             edi = edi1
         elif self.prog_sad_mask <= 0:
             if not is_gray:
@@ -1123,7 +1132,175 @@ class QTGMC(CustomIntEnum):
                 )
 
         # --- Create basic output
-        # TODO: havsfunc.py:1383
+
+        # Use motion vectors to blur interpolated image (edi) with motion-compensated previous and next frames.
+        # As above, this is done to remove shimmer from alternate frames so the same binomial kernels are used.
+        # However, by using motion-compensated smoothing this time we avoid motion blur.
+        # The use of MDegrain1 (motion compensated) rather than TemporalSmooth makes
+        # the weightings *look* different, but they evaluate to the same values
+
+        # Create linear weightings of neighbors first
+        # -2    -1    0     1     2
+        if self.tr1 > 0:
+            # 0.00  0.33  0.33  0.33  0.00
+            degrain1 = core.mv.Degrain1(
+                edi,
+                edi_super,
+                self.b_vec1,
+                self.f_vec1,
+                thsad=self.me.th_sad1,
+                thscd1=self.me.th_scd1,
+                thscd2=self.me.th_scd2,
+            )
+        if self.tr1 > 1:
+            # 0.33  0.00  0.33  0.00  0.33
+            degrain2 = core.mv.Degrain1(
+                edi,
+                edi_super,
+                self.b_vec2,
+                self.f_vec2,
+                thsad=self.me.th_sad1,
+                thscd1=self.me.th_scd1,
+                thscd2=self.me.th_scd2,
+            )
+
+        # Combine linear weightings to give binomial weightings - TR1=0: (1), TR1=1: (1:2:1), TR1=2: (1:4:6:4:1)
+        if self.tr1 <= 0:
+            binomial1 = edi
+        elif self.tr1 == 1:
+            binomial1 = core.std.Merge(degrain1, edi, weight=0.25)
+        else:
+            binomial1 = core.std.Merge(
+                core.std.Merge(degrain1, degrain2, weight=0.2), edi, weight=0.0625
+            )
+
+        # Remove areas of difference between smoothed image and interpolated image
+        # that are not bob-shimmer fixes: repairs residual motion blur from temporal smooth
+        if self.repair.repair1 <= 0:
+            repair1 = binomial1
+        else:
+            repair1 = self._keep_only_bob_shimmer_fixes(
+                binomial1, edi, self.repair.repair1, self.repair.rep_chroma
+            )
+
+        # Apply source match - use difference between output and source to successively refine output
+        # [extracted to function to clarify main code path]
+        if self.source_match.source_match <= 0:
+            match = repair1
+        else:
+            match = self._apply_source_match(
+                repair1,
+                edi_clip,
+                self.b_vec1 if self.max_tr > 0 else None,
+                self.f_vec1 if self.max_tr > 0 else None,
+                self.b_vec2 if self.max_tr > 1 else None,
+                self.f_vec2 if self.max_tr > 1 else None,
+                hpad,
+                vpad,
+                tff,
+            )
+
+        # Lossless=2 - after preparing an interpolated, de-shimmered clip,
+        # restore the original source fields into it and clean up any artefacts
+        # This mode will not give a true lossless result because the resharpening and final temporal smooth
+        # are still to come, but it will add further detail
+        # However, it can introduce minor combing. This setting is best used together with source-match
+        # it's effectively the final source-match stage)
+        if self.lossless >= 2:
+            lossed1 = self._make_lossless(match, inner_clip, tff)
+        else:
+            lossed1 = match
+
+        # --- Resharpen / retouch output
+
+        # Resharpen to counteract temporal blurs.
+        # Little sharpening needed for source-match mode since it has already recovered sharpness from source
+        if self.sharp.sharp_mode <= 0:
+            resharp = lossed1
+        elif self.sharp.sharp_mode == 1:
+            resharp = core.std.Expr(
+                [lossed1, lossed1.std.Convolution(matrix=self._matrix)],
+                expr=f"x x y - {self.sharp.sharp_adj} * +",
+            )
+        else:
+            vresharp1 = core.std.Merge(
+                lossed1.std.Maximum(coordinates=[0, 1, 0, 0, 0, 0, 1, 0]),
+                lossed1.std.Minimum(coordinates=[0, 1, 0, 0, 0, 0, 1, 0]),
+            )
+            if self.precise:  # Precise mode: reduce tiny overshoot
+                vresharp = core.std.Expr(
+                    [vresharp1, lossed1],
+                    expr="x y < x {i1} + x y > x {i1} - x ? ?".format(
+                        i1=scale_value(1, 8, bit_depth)
+                    ),
+                )
+            else:
+                vresharp = vresharp1
+            resharp = core.std.Expr(
+                [lossed1, vresharp.std.Convolution(matrix=self._matrix)],
+                expr=f"x x y - {self.sharp.sharp_adj} * +",
+            )
+
+        # Slightly thin down 1-pixel high horizontal edges that have been widened
+        # into neighboring field lines by the interpolator
+        sv_thin_sc = self.sharp.sharp_thin * 6.0
+        if self.sharp.sharp_thin > 0:
+            expr = f"y x - {sv_thin_sc} * {neutral} +"
+            vert_med_d = core.std.Expr(
+                [lossed1, lossed1.rgvs.VerticalCleaner(mode=1 if is_gray else [1, 0])],
+                expr=expr if is_gray else [expr, ""],
+            )
+            vert_med_d = vert_med_d.std.Convolution(
+                matrix=[1, 2, 1], planes=0, mode="h"
+            )
+            expr = f"y {neutral} - abs x {neutral} - abs > y {neutral} ?"
+            neighbor_d = core.std.Expr(
+                [vert_med_d, vert_med_d.std.Convolution(matrix=self._matrix, planes=0)],
+                expr=expr if is_gray else [expr, ""],
+            )
+            thin = core.std.MergeDiff(resharp, neighbor_d, planes=0)
+        else:
+            thin = resharp
+
+        # Back blend the blurred difference between sharpened & unsharpened clip,
+        # before (1st) sharpness limiting (Sbb == 1,3).
+        # A small fidelity improvement
+        if self.sharp.sharp_back_blend not in [1, 3]:
+            back_blend1 = thin
+        else:
+            back_blend1 = core.std.MakeDiff(
+                thin,
+                gauss_blur(
+                    core.std.MakeDiff(thin, lossed1, planes=0).std.Convolution(
+                        matrix=self._matrix, planes=0
+                    ),
+                    1.2,
+                ),
+                planes=0,
+            )
+
+        # Limit over-sharpening by clamping to neighboring (spatial or temporal) min/max values in original
+        # Occurs here (before final temporal smooth) if SLMode == 1,2.
+        # This location will restrict sharpness more, but any artefacts introduced will be smoothed
+        if self.sharp.sharp_limit_mode == 1:
+            if self.sharp.sharp_limit_rad <= 1:
+                sharp_limit1 = core.rgvs.Repair(back_blend1, edi, mode=1)
+            else:
+                sharp_limit1 = core.rgvs.Repair(
+                    back_blend1, core.rgvs.Repair(back_blend1, edi, mode=12), mode=1
+                )
+        elif self.sharp.sharp_limit_mode == 2:
+            sharp_limit1 = mt_clamp(
+                back_blend1,
+                t_max,
+                t_min,
+                self.sharp.sharp_overshoot,
+                self.sharp.sharp_overshoot,
+            )
+        else:
+            sharp_limit1 = back_blend1
+
+        # TODO: havsfunc.py:1499
 
         pass
 
@@ -1185,12 +1362,12 @@ class QTGMC(CustomIntEnum):
         if self.me.search_clip_pp == 1:
             spatial_blur = (
                 repair0.resize.Bilinear(width // 2, height // 2)
-                .std.Convolution(matrix=self.matrix, planes=cm_planes)
+                .std.Convolution(matrix=self._matrix, planes=cm_planes)
                 .resize.Bilinear(width, height)
             )
         elif self.me.search_clip_pp >= 2:
             spatial_blur = gauss_blur(
-                repair0.std.Convolution(matrix=self.matrix, planes=cm_planes), 1.75
+                repair0.std.Convolution(matrix=self._matrix, planes=cm_planes), 1.75
             )
             spatial_blur = core.std.Merge(
                 spatial_blur,
@@ -1240,8 +1417,37 @@ class QTGMC(CustomIntEnum):
         pass
 
     def _interpolate(
-        self, edi_input: vs.VideoNode, bobbed: vs.VideoNode, tff: bool
+        self,
+        edi_input: vs.VideoNode,
+        bobbed: vs.VideoNode,
+        edi_mode: EdiMethod,
+        nn_size: int,
+        num_neurons: int,
+        edi_qual: int,
+        edi_max_dist: int,
+        tff: bool,
     ) -> vs.VideoNode:
+        # TODO
+        pass
+
+    def _apply_source_match(
+        self,
+        deint: vs.VideoNode,
+        source: vs.VideoNode,
+        b_vec1: Optional[vs.VideoNode],
+        f_vec1: Optional[vs.VideoNode],
+        b_vec2: Optional[vs.VideoNode],
+        f_vec2: Optional[vs.VideoNode],
+        hpad: int,
+        vpad: int,
+        tff: bool,
+    ) -> vs.VideoNode:
+        # TODO
+        pass
+
+    def _make_lossless(
+        self, input: vs.VideoNode, source: vs.VideoNode, tff: Optional[bool] = None
+    ):
         # TODO
         pass
 
@@ -1265,3 +1471,24 @@ def scdetect(clip: vs.VideoNode, threshold: float = 0.1) -> vs.VideoNode:
         sc = clip.std.ModifyFrame([clip, sc], _copy_property)
 
     return sc
+
+
+# TODO: Is there a function for this in JET?
+def mt_clamp(
+    clip: vs.VideoNode,
+    bright: vs.VideoNode,
+    dark: vs.VideoNode,
+    overshoot: int = 0,
+    undershoot: int = 0,
+    planes: PlanesT = None,
+) -> vs.VideoNode:
+    """clamp the value of the clip between bright + overshoot and dark - undershoot"""
+    check_ref_clip(clip, bright, mt_clamp)
+    check_ref_clip(clip, dark, mt_clamp)
+    planes = normalize_planes(clip, planes)
+
+    if complexpr_available:
+        expr = f"x z {undershoot} - y {overshoot} + clamp"
+    else:
+        expr = f"x z {undershoot} - max y {overshoot} + min"
+    return norm_expr([clip, bright, dark], expr, planes)
