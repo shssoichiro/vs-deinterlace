@@ -6,7 +6,7 @@ import vapoursynth as vs
 from typing import Optional, Union, Any, Mapping
 
 from stgpytools import CustomIntEnum, fallback
-from vsdenoise import SearchMode, prefilter_to_full_range
+from vsdenoise import SearchMode, prefilter_to_full_range, nl_means, BM3D
 from vsrgtools import gauss_blur
 from vstools import (
     FieldBased,
@@ -774,7 +774,7 @@ class QTGMC(CustomIntEnum):
                 self.search_super = self.search_clip.mv.Super(
                     sharp=self.me.sub_pel_interp,
                     chroma=self.me.chroma_motion,
-                    **super_args
+                    **super_args,
                 )
             if not isinstance(self.b_vec1, vs.VideoNode):
                 self.b_vec1 = self.search_super.mv.Analyse(
@@ -831,7 +831,304 @@ class QTGMC(CustomIntEnum):
 
         # Expand fields to full frame size before extracting noise
         # (allows use of motion vectors which are frame-sized)
-        # TODO: havsfunc.py:1253
+        if self.noise.noise_process > 0:
+            if self.input_type == InputType.INTERLACED:
+                full_clip = clip.resize.Bob(tff=tff, filter_param_a=0, filter_param_b=1)
+            else:
+                full_clip = clip
+
+            if self.noise.noise_tr > 0:
+                full_super = full_clip.mv.Super(
+                    levels=1, chroma=self.noise.chroma_noise, **super_args
+                )
+
+            cn_planes = [0, 1, 2] if self.noise.chroma_noise and not is_gray else [0]
+
+            # Create a motion compensated temporal window around current frame and use to guide denoisers
+            if not self.noise.denoise_mc or self.noise.noise_tr <= 0:
+                noise_window = full_clip
+            elif self.noise.noise_tr == 1:
+                noise_window = core.std.Interleave(
+                    [
+                        core.mv.Compensate(
+                            full_clip,
+                            full_super,
+                            self.f_vec1,
+                            thscd1=self.me.th_scd1,
+                            thscd2=self.me.th_scd2,
+                        ),
+                        full_clip,
+                        core.mv.Compensate(
+                            full_clip,
+                            full_super,
+                            self.b_vec1,
+                            thscd1=self.me.th_scd1,
+                            thscd2=self.me.th_scd2,
+                        ),
+                    ]
+                )
+            else:
+                noise_window = core.std.Interleave(
+                    [
+                        core.mv.Compensate(
+                            full_clip,
+                            full_super,
+                            self.f_vec2,
+                            thscd1=self.me.th_scd1,
+                            thscd2=self.me.th_scd2,
+                        ),
+                        core.mv.Compensate(
+                            full_clip,
+                            full_super,
+                            self.f_vec1,
+                            thscd1=self.me.th_scd1,
+                            thscd2=self.me.th_scd2,
+                        ),
+                        full_clip,
+                        core.mv.Compensate(
+                            full_clip,
+                            full_super,
+                            self.b_vec1,
+                            thscd1=self.me.th_scd1,
+                            thscd2=self.me.th_scd2,
+                        ),
+                        core.mv.Compensate(
+                            full_clip,
+                            full_super,
+                            self.b_vec2,
+                            thscd1=self.me.th_scd1,
+                            thscd2=self.me.th_scd2,
+                        ),
+                    ]
+                )
+
+            if self.noise.denoiser == DenoiseMethod.BM3D:
+                dn_window = BM3D.denoise(
+                    noise_window,
+                    self.noise.sigma,
+                    self.noise.noise_tr,
+                    planes=cn_planes,
+                )
+            elif self.noise.denoiser == DenoiseMethod.DFTTEST:
+                dn_window = noise_window.dfttest.DFTTest(
+                    sigma=self.noise.sigma * 4,
+                    tbsize=self.noise.noise_td,
+                    planes=cn_planes,
+                )
+            elif self.noise.denoiser == DenoiseMethod.KNLMeans:
+                dn_window = nl_means(
+                    noise_window,
+                    strength=self.noise.sigma,
+                    tr=self.noise.noise_tr,
+                    planes=cn_planes,
+                )
+            else:
+                dn_window = noise_window.fft3dfilter.FFT3DFilter(
+                    sigma=self.noise.sigma,
+                    planes=cn_planes,
+                    bt=self.noise.noise_td,
+                    ncpu=self.noise.fft_threads,
+                )
+
+                # Rework denoised clip to match source format - various code paths here:
+                # discard the motion compensation window, discard doubled lines (from point resize)
+                # Also reweave to get interlaced noise if source was interlaced
+                # (could keep the full frame of noise, but it will be poor quality from the point resize)
+                if not self.noise.denoise_mc:
+                    if self.input_type != InputType.INTERLACED:
+                        denoised = dn_window
+                    else:
+                        denoised = (
+                            dn_window.std.SeparateFields(tff=tff)
+                            .std.SelectEvery(cycle=4, offsets=[0, 3])
+                            .std.DoubleWeave(tff)[::2]
+                        )
+                elif self.input_type != InputType.INTERLACED:
+                    if self.noise.noise_tr <= 0:
+                        denoised = dn_window
+                    else:
+                        denoised = dn_window.std.SelectEvery(
+                            cycle=self.noise.noise_td, offsets=self.noise.noise_tr
+                        )
+                else:
+                    denoised = (
+                        dn_window.std.SeparateFields(tff=tff)
+                        .std.SelectEvery(
+                            cycle=self.noise.noise_td * 4,
+                            offsets=[
+                                self.noise.noise_tr * 2,
+                                self.noise.noise_tr * 6 + 3,
+                            ],
+                        )
+                        .std.DoubleWeave(tff)[::2]
+                    )
+
+                if self.noise.total_restore > 0:
+                    # Get actual noise from difference.
+                    # Then 'deinterlace' where we have weaved noise -
+                    # create the missing lines of noise in various ways
+                    noise = core.std.MakeDiff(clip, denoised, planes=cn_planes)
+                    if self.input_type != InputType.INTERLACED:
+                        deint_noise = noise
+                    elif self.noise.noise_deint == DeintMethod.BOB:
+                        deint_noise = noise.resize.Bob(
+                            tff=tff, filter_param_a=0, filter_param_b=0.5
+                        )
+                    elif self.noise.noise_deint == DeintMethod.GENERATE:
+                        deint_noise = self._generate_2nd_field_noise(
+                            noise, denoised, tff
+                        )
+                    else:
+                        deint_noise = noise.std.SeparateFields(tff=tff).std.DoubleWeave(
+                            tff=tff
+                        )
+
+                    # Motion-compensated stabilization of generated noise
+                    if self.noise.stabilize_noise:
+                        noise_super = deint_noise.mv.Super(
+                            sharp=self.me.sub_pel_interp,
+                            levels=1,
+                            chroma=self.noise.chroma_noise,
+                            **super_args,
+                        )
+                        mc_noise = core.mv.Compensate(
+                            deint_noise,
+                            noise_super,
+                            self.b_vec1,
+                            thscd1=self.me.th_scd1,
+                            thscd2=self.me.th_scd2,
+                        )
+                        expr = f"x {neutral} - abs y {neutral} - abs > x y ? 0.6 * x y + 0.2 * +"
+                        final_noise = core.std.Expr(
+                            [deint_noise, mc_noise],
+                            expr=(
+                                expr
+                                if self.noise.chroma_noise or is_gray
+                                else [expr, ""]
+                            ),
+                        )
+                    else:
+                        final_noise = deint_noise
+
+            # If NoiseProcess=1 denoise input clip.
+            # If NoiseProcess=2 leave noise in the clip and let the temporal blurs
+            # "denoise" it for a stronger effect
+            inner_clip = denoised if self.noise.noise_process == 1 else clip
+
+            # --- Interpolation
+
+            # Support badly deinterlaced progressive content -
+            # drop half the fields and reweave to get 1/2fps interlaced stream
+            # appropriate for QTGMC processing
+            if self.input_type == InputType.PROG_MODE2:
+                edi_input = (
+                    inner_clip.std.SeparateFields(tff=tff)
+                    .std.SelectEvery(cycle=4, offsets=[0, 3])
+                    .std.DoubleWeave(tff)[::2]
+                )
+            else:
+                edi_input = inner_clip
+
+            # Create interpolated image as starting point for output
+            if edi_clip is not None:
+                edi1 = edi_clip.resize.Point(
+                    width,
+                    height,
+                    src_top=(edi_clip.height - height) // 2,
+                    src_height=height,
+                )
+            else:
+                edi1 = self._interpolate(
+                    edi_input,
+                    bobbed,
+                    tff,
+                )
+
+            # InputType=2,3: use motion mask to blend luma
+            # between original clip & reweaved clip based on ProgSADMask setting.
+            # Use chroma from original clip in any case
+            if self.input_type != InputType.PROG_MODE2:
+                edi = edi1
+            elif self.prog_sad_mask <= 0:
+                if not is_gray:
+                    edi = core.std.ShufflePlanes(
+                        [edi1, inner_clip],
+                        planes=[0, 1, 2],
+                        colorfamily=clip.format.color_family,
+                    )
+                else:
+                    edi = edi1
+            else:
+                input_type_blend = core.mv.Mask(
+                    depth(self.search_clip, 8, dither_type=DitherType.NONE),
+                    self.b_vec1,
+                    kind=1,
+                    ml=self.prog_sad_mask,
+                )
+                input_type_blend = depth(
+                    input_type_blend,
+                    self.search_clip.format.bits_per_sample,
+                    dither_type=DitherType.NONE,
+                )
+                edi = core.std.MaskedMerge(inner_clip, edi1, input_type_blend, planes=0)
+
+            # Get the max/min value for each pixel over neighboring motion-compensated frames -
+            # used for temporal sharpness limiting
+            if self.tr1 > 0 or self.sharp.temporal_sharp_limit:
+                edi_super = edi.mv.Super(
+                    sharp=self.me.sub_pel_interp, levels=1, **super_args
+                )
+
+            if self.sharp.temporal_sharp_limit:
+                b_comp1 = core.mv.Compensate(
+                    edi,
+                    edi_super,
+                    self.b_vec1,
+                    thscd1=self.me.th_scd1,
+                    thscd2=self.me.th_scd2,
+                )
+                f_comp1 = core.mv.Compensate(
+                    edi,
+                    edi_super,
+                    self.f_vec1,
+                    thscd1=self.me.th_scd1,
+                    thscd2=self.me.th_scd2,
+                )
+                t_max = core.std.Expr(
+                    [core.std.Expr([edi, f_comp1], expr="x y max"), b_comp1],
+                    expr="x y max",
+                )
+                t_min = core.std.Expr(
+                    [core.std.Expr([edi, f_comp1], expr="x y min"), b_comp1],
+                    expr="x y min",
+                )
+                if self.sharp.sharp_limit_rad > 1:
+                    b_comp3 = core.mv.Compensate(
+                        edi,
+                        edi_super,
+                        self.b_vec3,
+                        thscd1=self.me.th_scd1,
+                        thscd2=self.me.th_scd2,
+                    )
+                    f_comp3 = core.mv.Compensate(
+                        edi,
+                        edi_super,
+                        self.f_vec3,
+                        thscd1=self.me.th_scd1,
+                        thscd2=self.me.th_scd2,
+                    )
+                    t_max = core.std.Expr(
+                        [core.std.Expr([t_max, f_comp3], expr="x y max"), b_comp3],
+                        expr="x y max",
+                    )
+                    t_min = core.std.Expr(
+                        [core.std.Expr([t_min, f_comp3], expr="x y min"), b_comp3],
+                        expr="x y min",
+                    )
+
+        # --- Create basic output
+        # TODO: havsfunc.py:1383
+
         pass
 
     def _build_search_clip(
@@ -936,6 +1233,18 @@ class QTGMC(CustomIntEnum):
         ref: vs.VideoNode,
         repair: int = 1,
         chroma: bool = True,
+    ) -> vs.VideoNode:
+        # TODO
+        pass
+
+    def _generate_2nd_field_noise(
+        self, noise: vs.VideoNode, denoised: vs.VideoNode, tff: bool
+    ) -> vs.VideoNode:
+        # TODO
+        pass
+
+    def _interpolate(
+        self, edi_input: vs.VideoNode, bobbed: vs.VideoNode, tff: bool
     ) -> vs.VideoNode:
         # TODO
         pass
