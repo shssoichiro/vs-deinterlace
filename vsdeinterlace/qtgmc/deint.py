@@ -773,7 +773,9 @@ class QTGMC:
 
         # Bob the input as a starting point for the motion search clip
         if self.input_type == InputType.INTERLACED:
-            bobbed = clip.resize.Bob(tff=self._tff, filter_param_a=0, filter_param_b=0.5)
+            bobbed = clip.resize.Bob(
+                tff=self._tff, filter_param_a=0, filter_param_b=0.5
+            )
         elif self.input_type == InputType.PROGRESSIVE:
             bobbed = clip
         else:
@@ -894,7 +896,9 @@ class QTGMC:
         # (allows use of motion vectors which are frame-sized)
         if self.noise.noise_process > 0:
             if self.input_type == InputType.INTERLACED:
-                full_clip = clip.resize.Bob(tff=self._tff, filter_param_a=0, filter_param_b=1)
+                full_clip = clip.resize.Bob(
+                    tff=self._tff, filter_param_a=0, filter_param_b=1
+                )
             else:
                 full_clip = clip
 
@@ -1040,9 +1044,9 @@ class QTGMC:
                 elif self.noise.noise_deint == DeintMethod.GENERATE:
                     deint_noise = self._generate_2nd_field_noise(noise, denoised)
                 else:
-                    deint_noise = noise.std.SeparateFields(tff=self._tff).std.DoubleWeave(
+                    deint_noise = noise.std.SeparateFields(
                         tff=self._tff
-                    )
+                    ).std.DoubleWeave(tff=self._tff)
 
                 # Motion-compensated stabilization of generated noise
                 if self.noise.stabilize_noise:
@@ -1697,19 +1701,127 @@ class QTGMC:
 
     def _keep_only_bob_shimmer_fixes(
         self,
-        clip: vs.VideoNode,
+        input: vs.VideoNode,
         ref: vs.VideoNode,
         repair: int = 1,
         chroma: bool = True,
     ) -> vs.VideoNode:
-        # TODO
-        pass
+        """
+        Compare processed clip with reference clip: only allow thin, horizontal areas of difference, i.e. bob shimmer fixes
+        Rough algorithm: Get difference, deflate vertically by a couple of pixels or so, then inflate again.
+        Thin regions will be removed by this process.
+        Restore remaining areas of difference back to as they were in reference clip.
+        """
+
+        # erosion_dist = how much to deflate then reflate to remove thin areas of interest: 0 = minimum to 6 = maximum
+        # over_dilation - extra inflation to ensure areas to restore back are fully caught: 0 = none to 3 = one full pixel
+        # If Rep < 10, then ed = Rep and od = 0, otherwise ed = 10s digit and od = 1s digit
+        # (nasty method, but kept for compatibility with original TGMC)
+        erosion_dist = repair if repair < 10 else repair // 10
+        over_dilation = 0 if repair < 10 else repair % 10
+
+        diff = core.std.MakeDiff(ref, input)
+
+        coordinates = [0, 1, 0, 0, 0, 0, 1, 0]
+        planes = [0, 1, 2] if chroma and not self._is_gray else [0]
+
+        # Areas of positive difference
+        choke1 = diff.std.Minimum(planes=planes, coordinates=coordinates)
+        if erosion_dist > 2:
+            choke1 = choke1.std.Minimum(planes=planes, coordinates=coordinates)
+        if erosion_dist > 5:
+            choke1 = choke1.std.Minimum(planes=planes, coordinates=coordinates)
+        if erosion_dist % 3 != 0:
+            choke1 = choke1.std.Deflate(planes=planes)
+        if erosion_dist in [2, 5]:
+            choke1 = choke1.std.Median(planes=planes)
+        choke1 = choke1.std.Maximum(planes=planes, coordinates=coordinates)
+        if erosion_dist > 1:
+            choke1 = choke1.std.Maximum(planes=planes, coordinates=coordinates)
+        if erosion_dist > 4:
+            choke1 = choke1.std.Maximum(planes=planes, coordinates=coordinates)
+
+        # Over-dilation - extra reflation up to about 1 pixel
+        if over_dilation == 1:
+            choke1 = choke1.std.Inflate(planes=planes)
+        elif over_dilation == 2:
+            choke1 = choke1.std.Inflate(planes=planes).std.Inflate(planes=planes)
+        elif over_dilation >= 3:
+            choke1 = choke1.std.Maximum(planes=planes)
+
+        # Areas of negative difference (similar to above)
+        choke2 = diff.std.Maximum(planes=planes, coordinates=coordinates)
+        if erosion_dist > 2:
+            choke2 = choke2.std.Maximum(planes=planes, coordinates=coordinates)
+        if erosion_dist > 5:
+            choke2 = choke2.std.Maximum(planes=planes, coordinates=coordinates)
+        if erosion_dist % 3 != 0:
+            choke2 = choke2.std.Inflate(planes=planes)
+        if erosion_dist in [2, 5]:
+            choke2 = choke2.std.Median(planes=planes)
+        choke2 = choke2.std.Minimum(planes=planes, coordinates=coordinates)
+        if erosion_dist > 1:
+            choke2 = choke2.std.Minimum(planes=planes, coordinates=coordinates)
+        if erosion_dist > 4:
+            choke2 = choke2.std.Minimum(planes=planes, coordinates=coordinates)
+
+        if over_dilation == 1:
+            choke2 = choke2.std.Deflate(planes=planes)
+        elif over_dilation == 2:
+            choke2 = choke2.std.Deflate(planes=planes).std.Deflate(planes=planes)
+        elif over_dilation >= 3:
+            choke2 = choke2.std.Minimum(planes=planes)
+
+        # Combine above areas to find those areas of difference to restore
+        expr1 = f"x {scale_value(129, 8, self._bit_depth)} < x y {self._neutral} < {self._neutral} y ? ?"
+        expr2 = f"x {scale_value(127, 8, self._bit_depth)} > x y {self._neutral} > {self._neutral} y ? ?"
+        restore = core.std.Expr(
+            [
+                core.std.Expr(
+                    [diff, choke1],
+                    expr=expr1 if chroma or self._is_gray else [expr1, ""],
+                ),
+                choke2,
+            ],
+            expr=expr2 if chroma or self._is_gray else [expr2, ""],
+        )
+        return core.std.MergeDiff(input, restore, planes=planes)
 
     def _generate_2nd_field_noise(
-        self, noise: vs.VideoNode, denoised: vs.VideoNode
+        self, input: vs.VideoNode, interleaved: vs.VideoNode
     ) -> vs.VideoNode:
-        # TODO
-        pass
+        """
+        Given noise extracted from an interlaced source (i.e. the noise is interlaced),
+        generate "progressive" noise with a new "field" of noise injected.
+        The new noise is centered on a weighted local average and uses
+        the difference between local min & max as an estimate of local variance
+        """
+        planes = [0, 1, 2] if self.noise.chroma_noise and not self._is_gray else [0]
+
+        bits = get_depth(input)
+        neutral = 1 << (bits - 1)
+
+        orig_noise = input.std.SeparateFields(tff=self._tff)
+        noise_max = orig_noise.std.Maximum(planes=planes).std.Maximum(
+            planes=planes, coordinates=[0, 0, 0, 1, 1, 0, 0, 0]
+        )
+        noise_min = orig_noise.std.Minimum(planes=planes).std.Minimum(
+            planes=planes, coordinates=[0, 0, 0, 1, 1, 0, 0, 0]
+        )
+        random = (
+            interleaved.std.SeparateFields(tff=self._tff)
+            .std.BlankClip(color=[neutral] * input.format.num_planes)
+            .grain.Add(var=1800, uvar=1800 if self.noise.chroma_noise else 0)
+        )
+        expr = f"x {neutral} - y * {scale_value(256, 8, bits)} / {neutral} +"
+        var_random = core.std.Expr(
+            [core.std.MakeDiff(noise_max, noise_min, planes=planes), random],
+            expr=expr if self.noise.chroma_noise or self._is_gray else [expr, ""],
+        )
+        new_noise = core.std.MergeDiff(noise_min, var_random, planes=planes)
+        return core.std.Interleave([orig_noise, new_noise]).std.DoubleWeave(self._tff)[
+            ::2
+        ]
 
     def _interpolate(
         self,
@@ -1738,9 +1850,7 @@ class QTGMC:
         # self._f_vec2 if self.max_tr > 1 else None,
         pass
 
-    def _make_lossless(
-        self, input: vs.VideoNode, source: vs.VideoNode
-    ) -> vs.VideoNode:
+    def _make_lossless(self, input: vs.VideoNode, source: vs.VideoNode) -> vs.VideoNode:
         # TODO
         pass
 
