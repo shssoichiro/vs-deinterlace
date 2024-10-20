@@ -143,7 +143,7 @@ class QTGMCGlobals(dict[str, Any]):
     f_vec3: Optional[vs.VideoNode]
 
 
-class QTGMC(CustomIntEnum):
+class QTGMC:
     # These values are set when this class is initialized, based on the parameters supplied.
     # They may be edited by a user, but it is not advised, as that will override validation.
     input_type: InputType
@@ -179,11 +179,16 @@ class QTGMC(CustomIntEnum):
     _b_vec3: Optional[vs.VideoNode]
     _f_vec3: Optional[vs.VideoNode]
 
-    # These values are internal but are set once per run of `process`
+    # These values are internal and are set at the start of each run of `process`
     # (or are constant) and shared between multiple functions.
     _matrix: list[int] = [1, 2, 1, 2, 4, 2, 1, 2, 1]
+    _is_gray: bool
+    _bit_depth: int
+    _neutral: int
     _sharp_overshoot: float
     _noise_center: float
+    _cm_planes: list[int]
+    _cn_planes: list[int]
 
     def __init__(
         self,
@@ -744,12 +749,13 @@ class QTGMC(CustomIntEnum):
         if self.input_type != InputType.PROGRESSIVE and tff is None:
             tff = FieldBased.from_video(clip, True).is_tff
 
-        is_gray = clip.format.color_family == vs.GRAY
-        bit_depth = get_depth(clip)
-        neutral = 1 << (bit_depth - 1)
-
-        self._sharp_overshoot = scale_value(self.sharp.sharp_overshoot, 8, bit_depth)
-        self._noise_center = scale_value(128.5, 8, bit_depth)
+        self._is_gray = clip.format.color_family == vs.GRAY
+        self._bit_depth = get_depth(clip)
+        self._neutral = 1 << (self._bit_depth - 1)
+        self._sharp_overshoot = scale_value(
+            self.sharp.sharp_overshoot, 8, self._bit_depth
+        )
+        self._noise_center = scale_value(128.5, 8, self._bit_depth)
 
         width = clip.width
         height = clip.height
@@ -771,14 +777,14 @@ class QTGMC(CustomIntEnum):
         else:
             bobbed = clip.std.Convolution(matrix=[1, 2, 1], mode="v")
 
-        cm_planes = [0, 1, 2] if self.me.chroma_motion and not is_gray else [0]
+        self._cm_planes = (
+            [0, 1, 2] if self.me.chroma_motion and not self._is_gray else [0]
+        )
 
         if isinstance(search_clip, vs.VideoNode):
             self._search_clip = search_clip
         else:
-            self._search_clip = self._build_search_clip(
-                bobbed, cm_planes, width, height, bit_depth, is_gray
-            )
+            self._search_clip = self._build_search_clip(bobbed, width, height)
 
         super_args = dict(pel=self.me.sub_pel, hpad=hpad, vpad=vpad)
         analyse_args = dict(
@@ -895,7 +901,9 @@ class QTGMC(CustomIntEnum):
                     levels=1, chroma=self.noise.chroma_noise, **super_args
                 )
 
-            cn_planes = [0, 1, 2] if self.noise.chroma_noise and not is_gray else [0]
+            self._cn_planes = (
+                [0, 1, 2] if self.noise.chroma_noise and not self._is_gray else [0]
+            )
 
             # Create a motion compensated temporal window around current frame and use to guide denoisers
             if not self.noise.denoise_mc or self.noise.noise_tr <= 0:
@@ -960,25 +968,25 @@ class QTGMC(CustomIntEnum):
                     noise_window,
                     self.noise.sigma,
                     self.noise.noise_tr,
-                    planes=cn_planes,
+                    planes=self._cn_planes,
                 )
             elif self.noise.denoiser == DenoiseMethod.DFTTEST:
                 dn_window = noise_window.dfttest.DFTTest(
                     sigma=self.noise.sigma * 4,
                     tbsize=self.noise.noise_td,
-                    planes=cn_planes,
+                    planes=self._cn_planes,
                 )
             elif self.noise.denoiser == DenoiseMethod.KNLMeans:
                 dn_window = nl_means(
                     noise_window,
                     strength=self.noise.sigma,
                     tr=self.noise.noise_tr,
-                    planes=cn_planes,
+                    planes=self._cn_planes,
                 )
             else:
                 dn_window = noise_window.fft3dfilter.FFT3DFilter(
                     sigma=self.noise.sigma,
-                    planes=cn_planes,
+                    planes=self._cn_planes,
                     bt=self.noise.noise_td,
                     ncpu=self.noise.fft_threads,
                 )
@@ -1020,7 +1028,7 @@ class QTGMC(CustomIntEnum):
                 # Get actual noise from difference.
                 # Then 'deinterlace' where we have weaved noise -
                 # create the missing lines of noise in various ways
-                noise = core.std.MakeDiff(clip, denoised, planes=cn_planes)
+                noise = core.std.MakeDiff(clip, denoised, planes=self._cn_planes)
                 if self.input_type != InputType.INTERLACED:
                     deint_noise = noise
                 elif self.noise.noise_deint == DeintMethod.BOB:
@@ -1049,11 +1057,13 @@ class QTGMC(CustomIntEnum):
                         thscd1=self.me.th_scd1,
                         thscd2=self.me.th_scd2,
                     )
-                    expr = f"x {neutral} - abs y {neutral} - abs > x y ? 0.6 * x y + 0.2 * +"
+                    expr = f"x {self._neutral} - abs y {self._neutral} - abs > x y ? 0.6 * x y + 0.2 * +"
                     final_noise = core.std.Expr(
                         [deint_noise, mc_noise],
                         expr=(
-                            expr if self.noise.chroma_noise or is_gray else [expr, ""]
+                            expr
+                            if self.noise.chroma_noise or self._is_gray
+                            else [expr, ""]
                         ),
                     )
                 else:
@@ -1104,7 +1114,7 @@ class QTGMC(CustomIntEnum):
         if self.input_type != InputType.PROGRESSIVE_WITH_COMBING:
             edi = edi1
         elif self.prog_sad_mask <= 0:
-            if not is_gray:
+            if not self._is_gray:
                 edi = core.std.ShufflePlanes(
                     [edi1, inner_clip],
                     planes=[0, 1, 2],
@@ -1280,7 +1290,7 @@ class QTGMC(CustomIntEnum):
                 vresharp = core.std.Expr(
                     [vresharp1, lossed1],
                     expr="x y < x {i1} + x y > x {i1} - x ? ?".format(
-                        i1=scale_value(1, 8, bit_depth)
+                        i1=scale_value(1, 8, self._bit_depth)
                     ),
                 )
             else:
@@ -1294,18 +1304,23 @@ class QTGMC(CustomIntEnum):
         # into neighboring field lines by the interpolator
         sv_thin_sc = self.sharp.sharp_thin * 6.0
         if self.sharp.sharp_thin > 0:
-            expr = f"y x - {sv_thin_sc} * {neutral} +"
+            expr = f"y x - {sv_thin_sc} * {self._neutral} +"
             vert_med_d = core.std.Expr(
-                [lossed1, lossed1.rgvs.VerticalCleaner(mode=1 if is_gray else [1, 0])],
-                expr=expr if is_gray else [expr, ""],
+                [
+                    lossed1,
+                    lossed1.rgvs.VerticalCleaner(mode=1 if self._is_gray else [1, 0]),
+                ],
+                expr=expr if self._is_gray else [expr, ""],
             )
             vert_med_d = vert_med_d.std.Convolution(
                 matrix=[1, 2, 1], planes=0, mode="h"
             )
-            expr = f"y {neutral} - abs x {neutral} - abs > y {neutral} ?"
+            expr = (
+                f"y {self._neutral} - abs x {self._neutral} - abs > y {self._neutral} ?"
+            )
             neighbor_d = core.std.Expr(
                 [vert_med_d, vert_med_d.std.Convolution(matrix=self._matrix, planes=0)],
-                expr=expr if is_gray else [expr, ""],
+                expr=expr if self._is_gray else [expr, ""],
             )
             thin = core.std.MergeDiff(resharp, neighbor_d, planes=0)
         else:
@@ -1366,18 +1381,9 @@ class QTGMC(CustomIntEnum):
 
         # Add back any extracted noise, prior to final temporal smooth -
         # this will restore detail that was removed as "noise" without restoring the noise itself.
-        # Average luma of FFT3DFilter extracted noise is 128.5, so deal with that too
-        if self.noise.grain_restore <= 0:
-            add_noise1 = back_blend2
-        else:
-            expr = f"x {self._noise_center} - {self.noise.grain_restore} * {neutral} +"
-            add_noise1 = core.std.MergeDiff(
-                back_blend2,
-                final_noise.std.Expr(
-                    expr=expr if self.noise.chroma_noise or is_gray else [expr, ""]
-                ),
-                planes=cn_planes,
-            )
+        add_noise1 = self._grain_restore(
+            back_blend2, final_noise, self.noise.grain_restore
+        )
 
         # Final light linear temporal smooth for denoising
         if self.tr2 > 0:
@@ -1464,22 +1470,119 @@ class QTGMC(CustomIntEnum):
 
         # Add back any extracted noise, after final temporal smooth.
         # This will appear as noise/grain in the output.
-        # Average luma of FFT3DFilter extracted noise is 128.5, so deal with that too
-        if self.noise.noise_restore <= 0:
-            add_noise2 = lossed2
-        else:
-            expr = f"x {self._noise_center} - {self.noise.noise_restore} * {neutral} +"
-            add_noise2 = core.std.MergeDiff(
-                lossed2,
-                final_noise.std.Expr(
-                    expr=expr if self.noise.chroma_noise or is_gray else [expr, ""]
-                ),
-                planes=cn_planes,
+        add_noise2 = self._grain_restore(lossed2, final_noise, self.noise.noise_restore)
+
+        # --- Post-Processing
+
+        # Shutter motion blur - get level of blur depending on output framerate and blur already in source
+        blur_level = (
+            (
+                self.motion_blur.shutter_angle_out * self.fps_divisor
+                - self.motion_blur.shutter_angle_src
+            )
+            * 100
+            / 360
+        )
+        if blur_level < 0:
+            raise vs.Error(
+                "QTGMC: cannot reduce motion blur already in source: increase shutter_angle_out or fps_divisor"
+            )
+        if blur_level > 200:
+            raise vs.Error(
+                "QTGMC: exceeded maximum motion blur level: decrease shutter_angle_out or fps_divisor"
             )
 
-        # TODO: havsfunc:1558
+        # ShutterBlur mode 2,3 - get finer resolution motion vectors to reduce blur "bleeding" into static areas
+        r_block_divide = [1, 1, 2, 4][self.motion_blur.shutter_blur]
+        r_block_size = max(self.me.block_size // r_block_divide, 4)
+        r_overlap = max(self.me.overlap // r_block_divide, 2)
+        r_block_divide = self.me.block_size // r_block_size
+        r_lambda = self.me.coherence // (r_block_divide * r_block_divide)
+        if self.motion_blur.shutter_blur > 1:
+            recalculate_args = dict(
+                thsad=self.me.th_sad1,
+                blksize=r_block_size,
+                overlap=r_overlap,
+                search=self.me.search,
+                searchparam=self.me.search_param,
+                truemotion=self.me.true_motion,
+                lambda_=r_lambda,
+                pnew=self.me.penalty_new,
+                dct=self.me.dct,
+                chroma=self.me.chroma_motion,
+            )
+            sb_b_vec1 = core.mv.Recalculate(
+                self._search_super, self._b_vec1, **recalculate_args
+            )
+            sb_f_vec1 = core.mv.Recalculate(
+                self._search_super, self._f_vec1, **recalculate_args
+            )
+        elif self.motion_blur.shutter_blur > 0:
+            sb_b_vec1 = self._b_vec1
+            sb_f_vec1 = self._f_vec1
 
-        pass
+        # Shutter motion blur - use MFlowBlur to blur along motion vectors
+        if self.motion_blur.shutter_blur > 0:
+            sblur_super = add_noise2.mv.Super(
+                sharp=self.me.sub_pel_interp, levels=1, **super_args
+            )
+            sblur = core.mv.FlowBlur(
+                add_noise2,
+                sblur_super,
+                sb_b_vec1,
+                sb_f_vec1,
+                blur=blur_level,
+                thscd1=self.me.th_scd1,
+                thscd2=self.me.th_scd2,
+            )
+
+        # Shutter motion blur - use motion mask to reduce blurring in areas of low motion -
+        # also helps reduce blur "bleeding" into static areas, then select blur type
+        if self.motion_blur.shutter_blur <= 0:
+            sblurred = add_noise2
+        elif self.motion_blur.shutter_blur_limit <= 0:
+            sblurred = sblur
+        else:
+            sb_motion_mask = core.mv.Mask(
+                depth(self._search_clip, 8, dither_type=DitherType.NONE),
+                self._b_vec1,
+                kind=0,
+                ml=self.motion_blur.shutter_blur_limit,
+            )
+            sb_motion_mask = depth(
+                sb_motion_mask,
+                self._search_clip.format.bits_per_sample,
+                dither_type=DitherType.NONE,
+            )
+            sblurred = core.std.MaskedMerge(add_noise2, sblur, sb_motion_mask)
+
+        # Reduce frame rate
+        if self.fps_divisor > 1:
+            decimated = sblurred.std.SelectEvery(cycle=self.fps_divisor, offsets=0)
+        else:
+            decimated = sblurred
+
+        # Crop off temporary vertical padding
+        if self.border:
+            cropped = decimated.std.Crop(top=4, bottom=4)
+        else:
+            cropped = decimated
+
+        # Show output of choice
+        if self.noise.show_noise <= 0:
+            output = cropped
+        else:
+            expr = f"x {self._neutral} - {self.noise.show_noise} * {self._neutral} +"
+            output = final_noise.std.Expr(
+                expr=(
+                    expr
+                    if self.noise.chroma_noise or self._is_gray
+                    else [expr, repr(self._neutral)]
+                )
+            )
+        output = output.std.SetFieldBased(value=0)
+
+        return output
 
     def get_globals(self) -> QTGMCGlobals:
         return QTGMCGlobals(
@@ -1496,11 +1599,8 @@ class QTGMC(CustomIntEnum):
     def _build_search_clip(
         self,
         bobbed: vs.VideoNode,
-        cm_planes: list[int],
         width: int,
         height: int,
-        bit_depth: int,
-        is_gray: bool,
     ) -> vs.VideoNode:
         # The bobbed clip will shimmer due to being derived from alternating fields.
         # Temporally smooth over the neighboring frames using a binomial kernel.
@@ -1514,10 +1614,14 @@ class QTGMC(CustomIntEnum):
         # -2    -1    0     1     2
         if self.tr0 > 0:
             # 0.00  0.33  0.33  0.33  0.00
-            ts1 = bobbed.misc.AverageFrames([1] * 3, scenechange=True, planes=cm_planes)
+            ts1 = bobbed.misc.AverageFrames(
+                [1] * 3, scenechange=True, planes=self._cm_planes
+            )
         if self.tr0 > 1:
             # 0.20  0.20  0.20  0.20  0.20
-            ts2 = bobbed.misc.AverageFrames([1] * 5, scenechange=True, planes=cm_planes)
+            ts2 = bobbed.misc.AverageFrames(
+                [1] * 5, scenechange=True, planes=self._cm_planes
+            )
 
         # Combine linear weightings to give binomial weightings - TR0=0: (1), TR0=1: (1:2:1), TR0=2: (1:4:6:4:1)
         if self.tr0 <= 0:
@@ -1526,17 +1630,19 @@ class QTGMC(CustomIntEnum):
             binomial0 = core.std.Merge(
                 ts1,
                 bobbed,
-                weight=0.25 if self.me.chroma_motion or is_gray else [0.25, 0],
+                weight=0.25 if self.me.chroma_motion or self._is_gray else [0.25, 0],
             )
         else:
             binomial0 = core.std.Merge(
                 core.std.Merge(
                     ts1,
                     ts2,
-                    weight=0.357 if self.me.chroma_motion or is_gray else [0.357, 0],
+                    weight=(
+                        0.357 if self.me.chroma_motion or self._is_gray else [0.357, 0]
+                    ),
                 ),
                 bobbed,
-                weight=0.125 if self.me.chroma_motion or is_gray else [0.125, 0],
+                weight=0.125 if self.me.chroma_motion or self._is_gray else [0.125, 0],
             )
 
         # Remove areas of difference between temporal blurred motion search clip and bob
@@ -1551,17 +1657,18 @@ class QTGMC(CustomIntEnum):
         if self.me.search_clip_pp == 1:
             spatial_blur = (
                 repair0.resize.Bilinear(width // 2, height // 2)
-                .std.Convolution(matrix=self._matrix, planes=cm_planes)
+                .std.Convolution(matrix=self._matrix, planes=self._cm_planes)
                 .resize.Bilinear(width, height)
             )
         elif self.me.search_clip_pp >= 2:
             spatial_blur = gauss_blur(
-                repair0.std.Convolution(matrix=self._matrix, planes=cm_planes), 1.75
+                repair0.std.Convolution(matrix=self._matrix, planes=self._cm_planes),
+                1.75,
             )
             spatial_blur = core.std.Merge(
                 spatial_blur,
                 repair0,
-                weight=0.1 if self.me.chroma_motion or is_gray else [0.1, 0],
+                weight=0.1 if self.me.chroma_motion or self._is_gray else [0.1, 0],
             )
 
         if self.me.search_clip_pp <= 0:
@@ -1570,21 +1677,24 @@ class QTGMC(CustomIntEnum):
             search_clip = spatial_blur
         else:
             expr = "x {i3} + y < x {i3} + x {i3} - y > x {i3} - y ? ?".format(
-                i3=scale_value(3, 8, bit_depth)
+                i3=scale_value(3, 8, self._bit_depth)
             )
             tweaked = core.std.Expr(
                 [repair0, bobbed],
-                expr=expr if self.me.chroma_motion or is_gray else [expr, ""],
+                expr=expr if self.me.chroma_motion or self._is_gray else [expr, ""],
             )
             expr = "x {i7} + y < x {i2} + x {i7} - y > x {i2} - x 51 * y 49 * + 100 / ? ?".format(
-                i7=scale_value(7, 8, bit_depth), i2=scale_value(2, 8, bit_depth)
+                i7=scale_value(7, 8, self._bit_depth),
+                i2=scale_value(2, 8, self._bit_depth),
             )
             search_clip = core.std.Expr(
                 [spatial_blur, tweaked],
-                expr=expr if self.me.chroma_motion or is_gray else [expr, ""],
+                expr=expr if self.me.chroma_motion or self._is_gray else [expr, ""],
             )
-        search_clip = prefilter_to_full_range(search_clip, self.strength, cm_planes)
-        if bit_depth > 8 and self.me.fast_ma:
+        search_clip = prefilter_to_full_range(
+            search_clip, self.strength, self._cm_planes
+        )
+        if self._bit_depth > 8 and self.me.fast_ma:
             search_clip = depth(search_clip, 8, dither_type=DitherType.NONE)
 
         return search_clip
@@ -1640,8 +1750,26 @@ class QTGMC(CustomIntEnum):
         # TODO
         pass
 
+    def _grain_restore(
+        self, input: vs.VideoNode, final_noise: vs.VideoNode, strength: float
+    ) -> vs.VideoNode:
+        if self.noise.grain_restore <= 0:
+            return input
+        else:
+            # Average luma of FFT3DFilter extracted noise is 128.5, so deal with that too
+            expr = f"x {self._noise_center} - {strength} * {self._neutral} +"
+            return core.std.MergeDiff(
+                input,
+                final_noise.std.Expr(
+                    expr=(
+                        expr if self.noise.chroma_noise or self._is_gray else [expr, ""]
+                    )
+                ),
+                planes=self._cn_planes,
+            )
 
-# TODO: Is there a function for this in JET?
+
+# FIXME: Is there a function for this in JET?
 def scdetect(clip: vs.VideoNode, threshold: float = 0.1) -> vs.VideoNode:
     def _copy_property(_n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:
         fout = f[0].copy()
@@ -1662,7 +1790,7 @@ def scdetect(clip: vs.VideoNode, threshold: float = 0.1) -> vs.VideoNode:
     return sc
 
 
-# TODO: Is there a function for this in JET?
+# FIXME: Is there a function for this in JET?
 def mt_clamp(
     clip: vs.VideoNode,
     bright: vs.VideoNode,
