@@ -182,6 +182,7 @@ class QTGMC:
     # These values are internal and are set at the start of each run of `process`
     # (or are constant) and shared between multiple functions.
     _matrix: list[int] = [1, 2, 1, 2, 4, 2, 1, 2, 1]
+    _tff: bool
     _is_gray: bool
     _bit_depth: int
     _neutral: int
@@ -749,6 +750,7 @@ class QTGMC:
         if self.input_type != InputType.PROGRESSIVE and tff is None:
             tff = FieldBased.from_video(clip, True).is_tff
 
+        self._tff = tff
         self._is_gray = clip.format.color_family == vs.GRAY
         self._bit_depth = get_depth(clip)
         self._neutral = 1 << (self._bit_depth - 1)
@@ -771,7 +773,7 @@ class QTGMC:
 
         # Bob the input as a starting point for the motion search clip
         if self.input_type == InputType.INTERLACED:
-            bobbed = clip.resize.Bob(tff=tff, filter_param_a=0, filter_param_b=0.5)
+            bobbed = clip.resize.Bob(tff=self._tff, filter_param_a=0, filter_param_b=0.5)
         elif self.input_type == InputType.PROGRESSIVE:
             bobbed = clip
         else:
@@ -892,7 +894,7 @@ class QTGMC:
         # (allows use of motion vectors which are frame-sized)
         if self.noise.noise_process > 0:
             if self.input_type == InputType.INTERLACED:
-                full_clip = clip.resize.Bob(tff=tff, filter_param_a=0, filter_param_b=1)
+                full_clip = clip.resize.Bob(tff=self._tff, filter_param_a=0, filter_param_b=1)
             else:
                 full_clip = clip
 
@@ -1000,9 +1002,9 @@ class QTGMC:
                     denoised = dn_window
                 else:
                     denoised = (
-                        dn_window.std.SeparateFields(tff=tff)
+                        dn_window.std.SeparateFields(tff=self._tff)
                         .std.SelectEvery(cycle=4, offsets=[0, 3])
-                        .std.DoubleWeave(tff)[::2]
+                        .std.DoubleWeave(self._tff)[::2]
                     )
             elif self.input_type != InputType.INTERLACED:
                 if self.noise.noise_tr <= 0:
@@ -1013,7 +1015,7 @@ class QTGMC:
                     )
             else:
                 denoised = (
-                    dn_window.std.SeparateFields(tff=tff)
+                    dn_window.std.SeparateFields(tff=self._tff)
                     .std.SelectEvery(
                         cycle=self.noise.noise_td * 4,
                         offsets=[
@@ -1021,7 +1023,7 @@ class QTGMC:
                             self.noise.noise_tr * 6 + 3,
                         ],
                     )
-                    .std.DoubleWeave(tff)[::2]
+                    .std.DoubleWeave(self._tff)[::2]
                 )
 
             if self.noise.total_restore > 0:
@@ -1033,13 +1035,13 @@ class QTGMC:
                     deint_noise = noise
                 elif self.noise.noise_deint == DeintMethod.BOB:
                     deint_noise = noise.resize.Bob(
-                        tff=tff, filter_param_a=0, filter_param_b=0.5
+                        tff=self._tff, filter_param_a=0, filter_param_b=0.5
                     )
                 elif self.noise.noise_deint == DeintMethod.GENERATE:
-                    deint_noise = self._generate_2nd_field_noise(noise, denoised, tff)
+                    deint_noise = self._generate_2nd_field_noise(noise, denoised)
                 else:
-                    deint_noise = noise.std.SeparateFields(tff=tff).std.DoubleWeave(
-                        tff=tff
+                    deint_noise = noise.std.SeparateFields(tff=self._tff).std.DoubleWeave(
+                        tff=self._tff
                     )
 
                 # Motion-compensated stabilization of generated noise
@@ -1081,9 +1083,9 @@ class QTGMC:
         # appropriate for QTGMC processing
         if self.input_type == InputType.PROGRESSIVE_WITH_COMBING:
             edi_input = (
-                inner_clip.std.SeparateFields(tff=tff)
+                inner_clip.std.SeparateFields(tff=self._tff)
                 .std.SelectEvery(cycle=4, offsets=[0, 3])
-                .std.DoubleWeave(tff)[::2]
+                .std.DoubleWeave(self._tff)[::2]
             )
         else:
             edi_input = inner_clip
@@ -1105,7 +1107,6 @@ class QTGMC:
                 self.interp.num_neurons,
                 self.interp.edi_qual,
                 self.interp.edi_max_dist,
-                tff,
             )
 
         # InputType=2,3: use motion mask to blend luma
@@ -1250,13 +1251,8 @@ class QTGMC:
             match = self._apply_source_match(
                 repair1,
                 edi_clip,
-                self._b_vec1 if self.max_tr > 0 else None,
-                self._f_vec1 if self.max_tr > 0 else None,
-                self._b_vec2 if self.max_tr > 1 else None,
-                self._f_vec2 if self.max_tr > 1 else None,
                 hpad,
                 vpad,
-                tff,
             )
 
         # Lossless=2 - after preparing an interpolated, de-shimmered clip,
@@ -1266,7 +1262,7 @@ class QTGMC:
         # However, it can introduce minor combing. This setting is best used together with source-match
         # it's effectively the final source-match stage)
         if self.lossless >= 2:
-            lossed1 = self._make_lossless(match, inner_clip, tff)
+            lossed1 = self._make_lossless(match, inner_clip)
         else:
             lossed1 = match
 
@@ -1464,7 +1460,7 @@ class QTGMC:
         # but this will retain source artefacts and cause some combing
         # (where the smoothed deinterlace doesn't quite match the source)
         if self.lossless == 1:
-            lossed2 = self._make_lossless(sharp_limit2, inner_clip, tff)
+            lossed2 = self._make_lossless(sharp_limit2, inner_clip)
         else:
             lossed2 = sharp_limit2
 
@@ -1710,7 +1706,7 @@ class QTGMC:
         pass
 
     def _generate_2nd_field_noise(
-        self, noise: vs.VideoNode, denoised: vs.VideoNode, tff: bool
+        self, noise: vs.VideoNode, denoised: vs.VideoNode
     ) -> vs.VideoNode:
         # TODO
         pass
@@ -1724,7 +1720,6 @@ class QTGMC:
         num_neurons: int,
         edi_qual: int,
         edi_max_dist: int,
-        tff: bool,
     ) -> vs.VideoNode:
         # TODO
         pass
@@ -1733,19 +1728,18 @@ class QTGMC:
         self,
         deint: vs.VideoNode,
         source: vs.VideoNode,
-        b_vec1: Optional[vs.VideoNode],
-        f_vec1: Optional[vs.VideoNode],
-        b_vec2: Optional[vs.VideoNode],
-        f_vec2: Optional[vs.VideoNode],
         hpad: int,
         vpad: int,
-        tff: bool,
     ) -> vs.VideoNode:
         # TODO
+        # self._b_vec1 if self.max_tr > 0 else None,
+        # self._f_vec1 if self.max_tr > 0 else None,
+        # self._b_vec2 if self.max_tr > 1 else None,
+        # self._f_vec2 if self.max_tr > 1 else None,
         pass
 
     def _make_lossless(
-        self, input: vs.VideoNode, source: vs.VideoNode, tff: Optional[bool] = None
+        self, input: vs.VideoNode, source: vs.VideoNode
     ) -> vs.VideoNode:
         # TODO
         pass
