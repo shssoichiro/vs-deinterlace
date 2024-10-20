@@ -132,7 +132,20 @@ class MotionBlurSettings(dict[str, Any]):
     shutter_blur_limit: int
 
 
+class QTGMCGlobals(dict[str, Any]):
+    search_clip: Optional[vs.VideoNode]
+    search_super: Optional[vs.VideoNode]
+    b_vec1: Optional[vs.VideoNode]
+    f_vec1: Optional[vs.VideoNode]
+    b_vec2: Optional[vs.VideoNode]
+    f_vec2: Optional[vs.VideoNode]
+    b_vec3: Optional[vs.VideoNode]
+    f_vec3: Optional[vs.VideoNode]
+
+
 class QTGMC(CustomIntEnum):
+    # These values are set when this class is initialized, based on the parameters supplied.
+    # They may be edited by a user, but it is not advised, as that will override validation.
     input_type: InputType
     tr0: int
     tr1: int
@@ -153,16 +166,24 @@ class QTGMC(CustomIntEnum):
     noise: NoiseSettings
     motion_blur: MotionBlurSettings
 
-    _matrix: list[int] = [1, 2, 1, 2, 4, 2, 1, 2, 1]
+    # These values are set at runtime by `process`.
+    # They may alternatively be provided by the user as parameters in `process`,
+    # or accessed as outputs after running `process` via the `get_globals` function.
+    # This replaces the use of globals that was present in `havsfunc.QTGMC`.
+    _search_clip: Optional[vs.VideoNode]
+    _search_super: Optional[vs.VideoNode]
+    _b_vec1: Optional[vs.VideoNode]
+    _f_vec1: Optional[vs.VideoNode]
+    _b_vec2: Optional[vs.VideoNode]
+    _f_vec2: Optional[vs.VideoNode]
+    _b_vec3: Optional[vs.VideoNode]
+    _f_vec3: Optional[vs.VideoNode]
 
-    search_clip: Optional[vs.VideoNode]
-    search_super: Optional[vs.VideoNode]
-    b_vec1: Optional[vs.VideoNode]
-    f_vec1: Optional[vs.VideoNode]
-    b_vec2: Optional[vs.VideoNode]
-    f_vec2: Optional[vs.VideoNode]
-    b_vec3: Optional[vs.VideoNode]
-    f_vec3: Optional[vs.VideoNode]
+    # These values are internal but are set once per run of `process`
+    # (or are constant) and shared between multiple functions.
+    _matrix: list[int] = [1, 2, 1, 2, 4, 2, 1, 2, 1]
+    _sharp_overshoot: float
+    _noise_center: float
 
     def __init__(
         self,
@@ -689,15 +710,29 @@ class QTGMC(CustomIntEnum):
         tff: Optional[bool] = None,
         edi_clip: Optional[vs.VideoNode] = None,
         search_clip: Optional[vs.VideoNode] = None,
+        search_super: Optional[vs.VideoNode] = None,
+        b_vec1: Optional[vs.VideoNode] = None,
+        f_vec1: Optional[vs.VideoNode] = None,
+        b_vec2: Optional[vs.VideoNode] = None,
+        f_vec2: Optional[vs.VideoNode] = None,
+        b_vec3: Optional[vs.VideoNode] = None,
+        f_vec3: Optional[vs.VideoNode] = None,
     ) -> vs.VideoNode:
         """
         Process a given `clip` using QTGMC to deinterlace and/or fix shimmering and combing.
 
-        :param clip:        Clip to process
-        :param tff:         True if source material is top-field first, False if bottom-field first.
-                            None will attempt to infer from source clip.
-        :param edi_clip:    Externally created interpolated clip to use rather than QTGMC's interpolation.
-        :param search_clip: Filtered clip used for motion analysis
+        :param clip:         Clip to process
+        :param tff:          True if source material is top-field first, False if bottom-field first.
+                             None will attempt to infer from source clip.
+        :param edi_clip:     Externally created interpolated clip to use rather than QTGMC's interpolation.
+        :param search_clip:  Externally created filtered clip used for motion analysis.
+        :param search_super: Externally created MVTools "super" clip for filtered clip.
+        :param b_vec1:       Externally created backward motion vectors (temporal radius 1)
+        :param f_vec1:       Externally created forward motion vectors (temporal radius 1)
+        :param b_vec2:       Externally created backward motion vectors (temporal radius 2)
+        :param f_vec2:       Externally created forward motion vectors (temporal radius 2)
+        :param b_vec3:       Externally created backward motion vectors (temporal radius 3)
+        :param f_vec3:       Externally created forward motion vectors (temporal radius 3)
         """
 
         if not isinstance(clip, vs.VideoNode):
@@ -713,8 +748,8 @@ class QTGMC(CustomIntEnum):
         bit_depth = get_depth(clip)
         neutral = 1 << (bit_depth - 1)
 
-        sharp_overshoot = scale_value(self.sharp.sharp_overshoot, 8, bit_depth)
-        noise_center = scale_value(128.5, 8, bit_depth)
+        self._sharp_overshoot = scale_value(self.sharp.sharp_overshoot, 8, bit_depth)
+        self._noise_center = scale_value(128.5, 8, bit_depth)
 
         width = clip.width
         height = clip.height
@@ -739,9 +774,9 @@ class QTGMC(CustomIntEnum):
         cm_planes = [0, 1, 2] if self.me.chroma_motion and not is_gray else [0]
 
         if isinstance(search_clip, vs.VideoNode):
-            self.search_clip = search_clip
+            self._search_clip = search_clip
         else:
-            self.search_clip = self._build_search_clip(
+            self._search_clip = self._build_search_clip(
                 bobbed, cm_planes, width, height, bit_depth, is_gray
             )
 
@@ -774,61 +809,75 @@ class QTGMC(CustomIntEnum):
         )
 
         if self.max_tr > 0:
-            if not isinstance(self.search_super, vs.VideoNode):
-                self.search_super = self.search_clip.mv.Super(
+            if isinstance(search_super, vs.VideoNode):
+                self._search_super = search_super
+            else:
+                self._search_super = self._search_clip.mv.Super(
                     sharp=self.me.sub_pel_interp,
                     chroma=self.me.chroma_motion,
                     **super_args,
                 )
-            if not isinstance(self.b_vec1, vs.VideoNode):
-                self.b_vec1 = self.search_super.mv.Analyse(
+            if isinstance(b_vec1, vs.VideoNode):
+                self._b_vec1 = b_vec1
+            else:
+                self._b_vec1 = self._search_super.mv.Analyse(
                     isb=True, delta=1, **analyse_args
                 )
                 if self.me.refine_motion:
-                    self.b_vec1 = core.mv.Recalculate(
-                        self.search_super, self.b_vec1, **recalculate_args
+                    self._b_vec1 = core.mv.Recalculate(
+                        self._search_super, self._b_vec1, **recalculate_args
                     )
-            if not isinstance(self.f_vec1, vs.VideoNode):
-                self.f_vec1 = self.search_super.mv.Analyse(
+            if isinstance(f_vec1, vs.VideoNode):
+                self._f_vec1 = f_vec1
+            else:
+                self._f_vec1 = self._search_super.mv.Analyse(
                     isb=False, delta=1, **analyse_args
                 )
                 if self.me.refine_motion:
-                    self.f_vec1 = core.mv.Recalculate(
-                        self.search_super, self.f_vec1, **recalculate_args
+                    self._f_vec1 = core.mv.Recalculate(
+                        self._search_super, self._f_vec1, **recalculate_args
                     )
         if self.max_tr > 1:
-            if not isinstance(self.b_vec2, vs.VideoNode):
-                self.b_vec2 = self.search_super.mv.Analyse(
+            if isinstance(b_vec2, vs.VideoNode):
+                self._b_vec2 = b_vec2
+            else:
+                self._b_vec2 = self._search_super.mv.Analyse(
                     isb=True, delta=2, **analyse_args
                 )
                 if self.me.refine_motion:
-                    self.b_vec2 = core.mv.Recalculate(
-                        self.search_super, self.b_vec2, **recalculate_args
+                    self._b_vec2 = core.mv.Recalculate(
+                        self._search_super, self._b_vec2, **recalculate_args
                     )
-            if not isinstance(self.f_vec2, vs.VideoNode):
-                self.f_vec2 = self.search_super.mv.Analyse(
+            if isinstance(f_vec2, vs.VideoNode):
+                self._f_vec2 = f_vec2
+            else:
+                self._f_vec2 = self._search_super.mv.Analyse(
                     isb=False, delta=2, **analyse_args
                 )
                 if self.me.refine_motion:
-                    self.f_vec2 = core.mv.Recalculate(
-                        self.search_super, self.f_vec2, **recalculate_args
+                    self._f_vec2 = core.mv.Recalculate(
+                        self._search_super, self._f_vec2, **recalculate_args
                     )
         if self.max_tr > 2:
-            if not isinstance(self.b_vec3, vs.VideoNode):
-                self.b_vec3 = self.search_super.mv.Analyse(
+            if isinstance(b_vec3, vs.VideoNode):
+                self._b_vec3 = b_vec3
+            else:
+                self._b_vec3 = self._search_super.mv.Analyse(
                     isb=True, delta=3, **analyse_args
                 )
                 if self.me.refine_motion:
-                    self.b_vec3 = core.mv.Recalculate(
-                        self.search_super, self.b_vec3, **recalculate_args
+                    self._b_vec3 = core.mv.Recalculate(
+                        self._search_super, self._b_vec3, **recalculate_args
                     )
-            if not isinstance(self.f_vec3, vs.VideoNode):
-                self.f_vec3 = self.search_super.mv.Analyse(
+            if isinstance(f_vec3, vs.VideoNode):
+                self._f_vec3 = f_vec3
+            else:
+                self._f_vec3 = self._search_super.mv.Analyse(
                     isb=False, delta=3, **analyse_args
                 )
                 if self.me.refine_motion:
-                    self.f_vec3 = core.mv.Recalculate(
-                        self.search_super, self.f_vec3, **recalculate_args
+                    self._f_vec3 = core.mv.Recalculate(
+                        self._search_super, self._f_vec3, **recalculate_args
                     )
 
         # --- Noise Processing
@@ -857,7 +906,7 @@ class QTGMC(CustomIntEnum):
                         core.mv.Compensate(
                             full_clip,
                             full_super,
-                            self.f_vec1,
+                            self._f_vec1,
                             thscd1=self.me.th_scd1,
                             thscd2=self.me.th_scd2,
                         ),
@@ -865,7 +914,7 @@ class QTGMC(CustomIntEnum):
                         core.mv.Compensate(
                             full_clip,
                             full_super,
-                            self.b_vec1,
+                            self._b_vec1,
                             thscd1=self.me.th_scd1,
                             thscd2=self.me.th_scd2,
                         ),
@@ -877,14 +926,14 @@ class QTGMC(CustomIntEnum):
                         core.mv.Compensate(
                             full_clip,
                             full_super,
-                            self.f_vec2,
+                            self._f_vec2,
                             thscd1=self.me.th_scd1,
                             thscd2=self.me.th_scd2,
                         ),
                         core.mv.Compensate(
                             full_clip,
                             full_super,
-                            self.f_vec1,
+                            self._f_vec1,
                             thscd1=self.me.th_scd1,
                             thscd2=self.me.th_scd2,
                         ),
@@ -892,14 +941,14 @@ class QTGMC(CustomIntEnum):
                         core.mv.Compensate(
                             full_clip,
                             full_super,
-                            self.b_vec1,
+                            self._b_vec1,
                             thscd1=self.me.th_scd1,
                             thscd2=self.me.th_scd2,
                         ),
                         core.mv.Compensate(
                             full_clip,
                             full_super,
-                            self.b_vec2,
+                            self._b_vec2,
                             thscd1=self.me.th_scd1,
                             thscd2=self.me.th_scd2,
                         ),
@@ -996,7 +1045,7 @@ class QTGMC(CustomIntEnum):
                     mc_noise = core.mv.Compensate(
                         deint_noise,
                         noise_super,
-                        self.b_vec1,
+                        self._b_vec1,
                         thscd1=self.me.th_scd1,
                         thscd2=self.me.th_scd2,
                     )
@@ -1065,14 +1114,14 @@ class QTGMC(CustomIntEnum):
                 edi = edi1
         else:
             input_type_blend = core.mv.Mask(
-                depth(self.search_clip, 8, dither_type=DitherType.NONE),
-                self.b_vec1,
+                depth(self._search_clip, 8, dither_type=DitherType.NONE),
+                self._b_vec1,
                 kind=1,
                 ml=self.prog_sad_mask,
             )
             input_type_blend = depth(
                 input_type_blend,
-                self.search_clip.format.bits_per_sample,
+                self._search_clip.format.bits_per_sample,
                 dither_type=DitherType.NONE,
             )
             edi = core.std.MaskedMerge(inner_clip, edi1, input_type_blend, planes=0)
@@ -1088,14 +1137,14 @@ class QTGMC(CustomIntEnum):
             b_comp1 = core.mv.Compensate(
                 edi,
                 edi_super,
-                self.b_vec1,
+                self._b_vec1,
                 thscd1=self.me.th_scd1,
                 thscd2=self.me.th_scd2,
             )
             f_comp1 = core.mv.Compensate(
                 edi,
                 edi_super,
-                self.f_vec1,
+                self._f_vec1,
                 thscd1=self.me.th_scd1,
                 thscd2=self.me.th_scd2,
             )
@@ -1111,14 +1160,14 @@ class QTGMC(CustomIntEnum):
                 b_comp3 = core.mv.Compensate(
                     edi,
                     edi_super,
-                    self.b_vec3,
+                    self._b_vec3,
                     thscd1=self.me.th_scd1,
                     thscd2=self.me.th_scd2,
                 )
                 f_comp3 = core.mv.Compensate(
                     edi,
                     edi_super,
-                    self.f_vec3,
+                    self._f_vec3,
                     thscd1=self.me.th_scd1,
                     thscd2=self.me.th_scd2,
                 )
@@ -1146,8 +1195,8 @@ class QTGMC(CustomIntEnum):
             degrain1 = core.mv.Degrain1(
                 edi,
                 edi_super,
-                self.b_vec1,
-                self.f_vec1,
+                self._b_vec1,
+                self._f_vec1,
                 thsad=self.me.th_sad1,
                 thscd1=self.me.th_scd1,
                 thscd2=self.me.th_scd2,
@@ -1157,8 +1206,8 @@ class QTGMC(CustomIntEnum):
             degrain2 = core.mv.Degrain1(
                 edi,
                 edi_super,
-                self.b_vec2,
-                self.f_vec2,
+                self._b_vec2,
+                self._f_vec2,
                 thsad=self.me.th_sad1,
                 thscd1=self.me.th_scd1,
                 thscd2=self.me.th_scd2,
@@ -1191,10 +1240,10 @@ class QTGMC(CustomIntEnum):
             match = self._apply_source_match(
                 repair1,
                 edi_clip,
-                self.b_vec1 if self.max_tr > 0 else None,
-                self.f_vec1 if self.max_tr > 0 else None,
-                self.b_vec2 if self.max_tr > 1 else None,
-                self.f_vec2 if self.max_tr > 1 else None,
+                self._b_vec1 if self.max_tr > 0 else None,
+                self._f_vec1 if self.max_tr > 0 else None,
+                self._b_vec2 if self.max_tr > 1 else None,
+                self._f_vec2 if self.max_tr > 1 else None,
                 hpad,
                 vpad,
                 tff,
@@ -1294,15 +1343,155 @@ class QTGMC(CustomIntEnum):
                 back_blend1,
                 t_max,
                 t_min,
-                self.sharp.sharp_overshoot,
-                self.sharp.sharp_overshoot,
+                self._sharp_overshoot,
+                self._sharp_overshoot,
             )
         else:
             sharp_limit1 = back_blend1
 
-        # TODO: havsfunc.py:1499
+        # Back blend the blurred difference between sharpened & unsharpened clip, after (1st) sharpness limiting (Sbb == 2,3). A small fidelity improvement
+        if self.sharp.sharp_back_blend < 2:
+            back_blend2 = sharp_limit1
+        else:
+            back_blend2 = core.std.MakeDiff(
+                sharp_limit1,
+                gauss_blur(
+                    core.std.MakeDiff(sharp_limit1, lossed1, planes=0).std.Convolution(
+                        matrix=self._matrix, planes=0
+                    ),
+                    1.2,
+                ),
+                planes=0,
+            )
+
+        # Add back any extracted noise, prior to final temporal smooth -
+        # this will restore detail that was removed as "noise" without restoring the noise itself.
+        # Average luma of FFT3DFilter extracted noise is 128.5, so deal with that too
+        if self.noise.grain_restore <= 0:
+            add_noise1 = back_blend2
+        else:
+            expr = f"x {self._noise_center} - {self.noise.grain_restore} * {neutral} +"
+            add_noise1 = core.std.MergeDiff(
+                back_blend2,
+                final_noise.std.Expr(
+                    expr=expr if self.noise.chroma_noise or is_gray else [expr, ""]
+                ),
+                planes=cn_planes,
+            )
+
+        # Final light linear temporal smooth for denoising
+        if self.tr2 > 0:
+            stable_super = add_noise1.mv.Super(
+                sharp=self.me.sub_pel_interp, levels=1, **super_args
+            )
+        if self.tr2 <= 0:
+            stable = add_noise1
+        elif self.tr2 == 1:
+            stable = core.mv.Degrain1(
+                add_noise1,
+                stable_super,
+                self._b_vec1,
+                self._f_vec1,
+                thsad=self.me.th_sad2,
+                thscd1=self.me.th_scd1,
+                thscd2=self.me.th_scd2,
+            )
+        elif self.tr2 == 2:
+            stable = core.mv.Degrain2(
+                add_noise1,
+                stable_super,
+                self._b_vec1,
+                self._f_vec1,
+                self._b_vec2,
+                self._f_vec2,
+                thsad=self.me.th_sad2,
+                thscd1=self.me.th_scd1,
+                thscd2=self.me.th_scd2,
+            )
+        else:
+            stable = core.mv.Degrain3(
+                add_noise1,
+                stable_super,
+                self._b_vec1,
+                self._f_vec1,
+                self._b_vec2,
+                self._f_vec2,
+                self._b_vec3,
+                self._f_vec3,
+                thsad=self.me.th_sad2,
+                thscd1=self.me.th_scd1,
+                thscd2=self.me.th_scd2,
+            )
+
+        # Remove areas of difference between final output & basic interpolated image
+        # that are not bob-shimmer fixes: repairs motion blur caused by temporal smooth
+        if self.repair.repair2 <= 0:
+            repair2 = stable
+        else:
+            repair2 = self._keep_only_bob_shimmer_fixes(
+                stable, edi, self.repair.repair2, self.repair.rep_chroma
+            )
+
+        # Limit over-sharpening by clamping to neighboring (spatial or temporal) min/max values in original
+        # Occurs here (after final temporal smooth) if SLMode == 3,4.
+        # Allows more sharpening here, but more prone to introducing minor artefacts
+        if self.sharp.sharp_limit_mode == 3:
+            if self.sharp.sharp_limit_rad <= 1:
+                sharp_limit2 = core.rgvs.Repair(repair2, edi, mode=1)
+            else:
+                sharp_limit2 = core.rgvs.Repair(
+                    repair2, core.rgvs.Repair(repair2, edi, mode=12), mode=1
+                )
+        elif self.sharp.sharp_limit_mode >= 4:
+            sharp_limit2 = mt_clamp(
+                repair2,
+                t_max,
+                t_min,
+                self._sharp_overshoot,
+                self._sharp_overshoot,
+            )
+        else:
+            sharp_limit2 = repair2
+
+        # Lossless=1 - inject source fields into result and clean up inevitable artefacts.
+        # Provided NoiseRestore=0.0 or 1.0, this mode will make the script result properly lossless,
+        # but this will retain source artefacts and cause some combing
+        # (where the smoothed deinterlace doesn't quite match the source)
+        if self.lossless == 1:
+            lossed2 = self._make_lossless(sharp_limit2, inner_clip, tff)
+        else:
+            lossed2 = sharp_limit2
+
+        # Add back any extracted noise, after final temporal smooth.
+        # This will appear as noise/grain in the output.
+        # Average luma of FFT3DFilter extracted noise is 128.5, so deal with that too
+        if self.noise.noise_restore <= 0:
+            add_noise2 = lossed2
+        else:
+            expr = f"x {self._noise_center} - {self.noise.noise_restore} * {neutral} +"
+            add_noise2 = core.std.MergeDiff(
+                lossed2,
+                final_noise.std.Expr(
+                    expr=expr if self.noise.chroma_noise or is_gray else [expr, ""]
+                ),
+                planes=cn_planes,
+            )
+
+        # TODO: havsfunc:1558
 
         pass
+
+    def get_globals(self) -> QTGMCGlobals:
+        return QTGMCGlobals(
+            search_clip=self._search_clip,
+            search_super=self._search_super,
+            b_vec1=self._b_vec1,
+            f_vec1=self._f_vec1,
+            b_vec2=self._b_vec2,
+            f_vec2=self._f_vec2,
+            b_vec3=self._b_vec3,
+            f_vec3=self._f_vec3,
+        )
 
     def _build_search_clip(
         self,
@@ -1447,7 +1636,7 @@ class QTGMC(CustomIntEnum):
 
     def _make_lossless(
         self, input: vs.VideoNode, source: vs.VideoNode, tff: Optional[bool] = None
-    ):
+    ) -> vs.VideoNode:
         # TODO
         pass
 
