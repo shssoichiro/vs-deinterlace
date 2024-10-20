@@ -7,7 +7,8 @@ class EdiMethod:
     BOB = 0
     BWDIF = 1
     EEDI3 = 2
-    NNEDI3 = 3
+    EEDI3_PLUS_NNEDI3 = 3
+    NNEDI3 = 4
 
 
 class DenoiseMethod:

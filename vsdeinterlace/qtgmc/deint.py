@@ -6,6 +6,7 @@ import vapoursynth as vs
 from typing import Optional, Union, Any, Mapping
 
 from stgpytools import CustomIntEnum, fallback
+from vsaa import Nnedi3, Eedi3
 from vsdenoise import SearchMode, prefilter_to_full_range, nl_means, BM3D
 from vsexprtools import complexpr_available, norm_expr
 from vsrgtools import gauss_blur
@@ -487,7 +488,11 @@ class QTGMC:
             num_neurons=fallback(num_neurons, preset.num_neurons),
             edi_max_dist=fallback(edi_max_dist, preset.edi_max_dist),
             edi_qual=edi_qual,
-            chroma_edi=chroma_edi,
+            chroma_edi=(
+                chroma_edi
+                if chroma_edi in [EdiMethod.NNEDI3, EdiMethod.BWDIF, EdiMethod.BOB]
+                else EdiMethod.NNEDI3
+            ),
             nnedi3_args=nnedi3_args,
             eedi3_args=eedi3_args,
         )
@@ -1105,12 +1110,13 @@ class QTGMC:
         else:
             edi1 = self._interpolate(
                 edi_input,
-                bobbed,
                 self.interp.edi_mode,
                 self.interp.nn_size,
                 self.interp.num_neurons,
                 self.interp.edi_qual,
                 self.interp.edi_max_dist,
+                self.interp.chroma_edi,
+                fallback_clip=bobbed,
             )
 
         # InputType=2,3: use motion mask to blend luma
@@ -1825,16 +1831,69 @@ class QTGMC:
 
     def _interpolate(
         self,
-        edi_input: vs.VideoNode,
-        bobbed: vs.VideoNode,
+        input: vs.VideoNode,
         edi_mode: EdiMethod,
         nn_size: int,
         num_neurons: int,
         edi_qual: int,
         edi_max_dist: int,
+        fallback_clip: Optional[vs.VideoNode] = None,
+        chroma_edi: Optional[EdiMethod] = None,
     ) -> vs.VideoNode:
-        # TODO
-        pass
+        """
+        Interpolate input clip using method given in EdiMode. Use Fallback or Bob as result if mode not in list.
+        If ChromaEdi is set then interpolate chroma separately with that method (only really useful for EEDIx).
+        The function is used as main algorithm starting point and for first two source-match stages
+        """
+
+        if self.input_type == InputType.PROGRESSIVE:
+            return input
+
+        if self._is_gray:
+            chroma_edi = None
+        planes = [0, 1, 2] if chroma_edi is None and not self._is_gray else [0]
+
+        field = 3 if self._tff else 2
+
+        nnedi3_args = dict(
+            nsize=nn_size, nns=num_neurons, qual=edi_qual, **self.interp.nnedi3_args
+        )
+        eedi3_args = dict(mdis=edi_max_dist, **self.interp.eedi3_args)
+        nnedi3 = Nnedi3(field=field, **nnedi3_args)
+        eedi3 = Eedi3(field=field, **eedi3_args)
+
+        if edi_mode == EdiMethod.NNEDI3:
+            interp = nnedi3.interpolate(input, planes=planes, **nnedi3_args)
+        elif edi_mode == EdiMethod.EEDI3_PLUS_NNEDI3:
+            interp = eedi3.interpolate(
+                input,
+                sclip=nnedi3.interpolate(input, planes=planes, **nnedi3_args),
+                **eedi3_args,
+            )
+        elif edi_mode == EdiMethod.EEDI3:
+            interp = eedi3.interpolate(input, **eedi3_args)
+        elif edi_mode == EdiMethod.BWDIF:
+            interp = input.bwdif.Bwdif(field=field)
+        else:
+            interp = fallback(
+                fallback_clip,
+                input.resize.Bob(tff=self._tff, filter_param_a=0, filter_param_b=0.5),
+            )
+
+        if chroma_edi == EdiMethod.NNEDI3:
+            interpuv = nnedi3.interpolate(input, planes=[1, 2], nsize=4, nns=0, qual=1)
+        elif chroma_edi == EdiMethod.BWDIF:
+            interpuv = input.bwdif.Bwdif(field=field)
+        elif chroma_edi == EdiMethod.BOB:
+            interpuv = input.resize.Bob(
+                tff=self._tff, filter_param_a=0, filter_param_b=0.5
+            )
+        else:
+            return interp
+
+        return core.std.ShufflePlanes(
+            [interp, interpuv], planes=[0, 1, 2], colorfamily=input.format.color_family
+        )
 
     def _apply_source_match(
         self,
@@ -1843,16 +1902,292 @@ class QTGMC:
         hpad: int,
         vpad: int,
     ) -> vs.VideoNode:
-        # TODO
-        # self._b_vec1 if self.max_tr > 0 else None,
-        # self._f_vec1 if self.max_tr > 0 else None,
-        # self._b_vec2 if self.max_tr > 1 else None,
-        # self._f_vec2 if self.max_tr > 1 else None,
-        pass
+        """
+        Source-match, a three stage process that takes the difference between deinterlaced input
+        and the original interlaced source, to shift the input more towards the source without introducing shimmer.
+        All other arguments defined in main script
+        """
+
+        b_vec1 = self._b_vec1 if self.max_tr > 0 else None
+        f_vec1 = self._f_vec1 if self.max_tr > 0 else None
+        b_vec2 = self._b_vec2 if self.max_tr > 1 else None
+        f_vec2 = self._f_vec2 if self.max_tr > 1 else None
+
+        # Basic source-match.
+        # Find difference between source clip & equivalent fields in interpolated/smoothed clip (called the "error" in formula below).
+        # Ideally there should be no difference, we want the fields in the output to be as close as possible
+        # to the source whilst remaining shimmer-free. So adjust the *source* in such a way that
+        # smoothing it will give a result closer to the unadjusted source.
+        # Then rerun the interpolation (edi) and binomial smooth with this new source.
+        # Result will still be shimmer-free and closer to the original source.
+        # Formula used for correction is P0' = P0 + (P0-P1)/(k+S(1-k)),
+        # where P0 is original image, P1 is the 1st attempt at interpolation/smoothing,
+        # P0' is the revised image to use as new source for interpolation/smoothing,
+        # k is the weighting given to the current frame in the smooth,
+        # and S is a factor indicating "temporal similarity" of the error from frame to frame,
+        # i.e. S = average over all pixels of [neighbor frame error / current frame error].
+        # Decreasing S will make the result sharper, sensible range is about -0.25 to 1.0.
+        # Empirically, S=0.5 is effective [will do deeper analysis later]
+        error_temporal_similarity = 0.5  # S in formula described above
+        error_adjust1 = [
+            1.0,
+            2.0 / (1.0 + error_temporal_similarity),
+            8.0 / (3.0 + 5.0 * error_temporal_similarity),
+        ][self.source_match.match_tr1]
+        if (
+            self.source_match.source_match < 1
+            or self.input_type == InputType.PROGRESSIVE
+        ):
+            match1_clip = deint
+        else:
+            match1_clip = (
+                deint.std.SeparateFields(tff=self._tff)
+                .std.SelectEvery(cycle=4, offsets=[0, 3])
+                .std.DoubleWeave(self._tff)[::2]
+            )
+        if self.source_match.source_match < 1 or self.source_match.match_tr1 <= 0:
+            match1_update = source
+        else:
+            match1_update = core.std.Expr(
+                [source, match1_clip],
+                expr=f"x {error_adjust1 + 1} * y {error_adjust1} * -",
+            )
+        if self.source_match.source_match > 0:
+            match1_edi = self._interpolate(
+                match1_update,
+                self.source_match.match_edi,
+                self.source_match.match_nn_size,
+                self.source_match.match_num_neurons,
+                self.source_match.match_edi_qual,
+                self.source_match.match_edi_max_dist,
+            )
+            if self.source_match.match_tr1 > 0:
+                match1_super = match1_edi.mv.Super(
+                    pel=self.me.sub_pel,
+                    sharp=self.me.sub_pel_interp,
+                    levels=1,
+                    hpad=hpad,
+                    vpad=vpad,
+                )
+                match1_degrain1 = core.mv.Degrain1(
+                    match1_edi,
+                    match1_super,
+                    b_vec1,
+                    f_vec1,
+                    thsad=self.me.th_sad1,
+                    thscd1=self.me.th_scd1,
+                    thscd2=self.me.th_scd2,
+                )
+            if self.source_match.match_tr1 > 1:
+                match1_degrain2 = core.mv.Degrain1(
+                    match1_edi,
+                    match1_super,
+                    b_vec2,
+                    f_vec2,
+                    thsad=self.me.th_sad1,
+                    thscd1=self.me.th_scd1,
+                    thscd2=self.me.th_scd2,
+                )
+        if self.source_match.source_match < 1:
+            match1 = deint
+        elif self.source_match.match_tr1 <= 0:
+            match1 = match1_edi
+        elif self.source_match.match_tr1 == 1:
+            match1 = core.std.Merge(match1_degrain1, match1_edi, weight=0.25)
+        else:
+            match1 = core.std.Merge(
+                core.std.Merge(match1_degrain1, match1_degrain2, weight=0.2),
+                match1_edi,
+                weight=0.0625,
+            )
+
+        if self.source_match.source_match < 2:
+            return match1
+
+        # Enhance effect of source-match stages 2 & 3 by sharpening clip prior to refinement
+        # (source-match tends to underestimate so this will leave result sharper)
+        if self.source_match.source_match > 1 and self.source_match.match_enhance > 0:
+            match1_shp = core.std.Expr(
+                [match1, match1.std.Convolution(matrix=[1, 2, 1, 2, 4, 2, 1, 2, 1])],
+                expr=f"x x y - {self.source_match.match_enhance} * +",
+            )
+        else:
+            match1_shp = match1
+
+        # Source-match refinement.
+        # Find difference between source clip & equivalent fields in (updated) interpolated/smoothed clip.
+        # Interpolate & binomially smooth this difference then add it back to output.
+        # Helps restore differences that the basic match missed.
+        # However, as this pass works on a difference rather than the source image
+        # it can be prone to occasional artefacts (difference images are not ideal for interpolation).
+        # In fact a lower quality interpolation such as a simple bob often performs nearly as well as advanced, slower methods (e.g. NNEDI3)
+        if self.source_match.source_match < 2 or InputType == 1:
+            match2_clip = match1_shp
+        else:
+            match2_clip = (
+                match1_shp.std.SeparateFields(tff=self._tff)
+                .std.SelectEvery(cycle=4, offsets=[0, 3])
+                .std.DoubleWeave(self._tff)[::2]
+            )
+        if self.source_match.source_match > 1:
+            match2_diff = core.std.MakeDiff(source, match2_clip)
+            match2_edi = self._interpolate(
+                match2_diff,
+                self.source_match.match_edi2,
+                self.source_match.match_nn_size2,
+                self.source_match.match_num_neurons2,
+                self.source_match.match_edi_qual2,
+                self.source_match.match_edi_max_dist2,
+            )
+            if self.source_match.match_tr2 > 0:
+                match2_super = match2_edi.mv.Super(
+                    pel=self.me.sub_pel,
+                    sharp=self.me.sub_pel_interp,
+                    levels=1,
+                    hpad=hpad,
+                    vpad=vpad,
+                )
+                match2_degrain1 = core.mv.Degrain1(
+                    match2_edi,
+                    match2_super,
+                    b_vec1,
+                    f_vec1,
+                    thsad=self.me.th_sad1,
+                    thscd1=self.me.th_scd1,
+                    thscd2=self.me.th_scd2,
+                )
+            if self.source_match.match_tr2 > 1:
+                match2_degrain2 = core.mv.Degrain1(
+                    match2_edi,
+                    match2_super,
+                    b_vec2,
+                    f_vec2,
+                    thsad=self.me.th_sad1,
+                    thscd1=self.me.th_scd1,
+                    thscd2=self.me.th_scd2,
+                )
+        if self.source_match.source_match < 2:
+            match2 = match1
+        elif self.source_match.match_tr2 <= 0:
+            match2 = match2_edi
+        elif self.source_match.match_tr2 == 1:
+            match2 = core.std.Merge(match2_degrain1, match2_edi, weight=0.25)
+        else:
+            match2 = core.std.Merge(
+                core.std.Merge(match2_degrain1, match2_degrain2, weight=0.2),
+                match2_edi,
+                weight=0.0625,
+            )
+
+        # Source-match second refinement - correct error introduced in the refined difference by temporal smoothing.
+        # Similar to error correction from basic step
+        error_adjust2 = [
+            1.0,
+            2.0 / (1.0 + error_temporal_similarity),
+            8.0 / (3.0 + 5.0 * error_temporal_similarity),
+        ][self.source_match.match_tr2]
+        if self.source_match.source_match < 3 or self.source_match.match_tr2 <= 0:
+            match3_update = match2_edi
+        else:
+            match3_update = core.std.Expr(
+                [match2_edi, match2],
+                expr=f"x {error_adjust2 + 1} * y {error_adjust2} * -",
+            )
+        if self.source_match.source_match > 2:
+            if self.source_match.match_tr2 > 0:
+                match3_super = match3_update.mv.Super(
+                    pel=self.me.sub_pel,
+                    sharp=self.me.sub_pel_interp,
+                    levels=1,
+                    hpad=hpad,
+                    vpad=vpad,
+                )
+                match3_degrain1 = core.mv.Degrain1(
+                    match3_update,
+                    match3_super,
+                    b_vec1,
+                    f_vec1,
+                    thsad=self.me.th_sad1,
+                    thscd1=self.me.th_scd1,
+                    thscd2=self.me.th_scd2,
+                )
+            if self.source_match.match_tr2 > 1:
+                match3_degrain2 = core.mv.Degrain1(
+                    match3_update,
+                    match3_super,
+                    b_vec2,
+                    f_vec2,
+                    thsad=self.me.th_sad1,
+                    thscd1=self.me.th_scd1,
+                    thscd2=self.me.th_scd2,
+                )
+        if self.source_match.source_match < 3:
+            match3 = match2
+        elif self.source_match.match_tr2 <= 0:
+            match3 = match3_update
+        elif self.source_match.match_tr2 == 1:
+            match3 = core.std.Merge(match3_degrain1, match3_update, weight=0.25)
+        else:
+            match3 = core.std.Merge(
+                core.std.Merge(match3_degrain1, match3_degrain2, weight=0.2),
+                match3_update,
+                weight=0.0625,
+            )
+
+        # Apply difference calculated in source-match refinement
+        return core.std.MergeDiff(match1_shp, match3)
 
     def _make_lossless(self, input: vs.VideoNode, source: vs.VideoNode) -> vs.VideoNode:
-        # TODO
-        pass
+        """
+        Insert the source lines into the result to create a true lossless output.
+        However, the other lines in the result have had considerable processing and won't
+        exactly match source lines. There will be some slight residual combing.
+        Use vertical medians to clean a little of this away
+        """
+
+        if self.input_type == InputType.PROGRESSIVE:
+            raise vs.Error(
+                "QTGMC: lossless modes are incompatible with Progressive input type"
+            )
+
+        # Weave the source fields and the "new" fields that have generated in the input
+        if self.input_type == InputType.INTERLACED:
+            src_fields = source.std.SeparateFields(tff=self._tff)
+        else:
+            src_fields = source.std.SeparateFields(tff=self._tff).std.SelectEvery(
+                cycle=4, offsets=[0, 3]
+            )
+        new_fields = input.std.SeparateFields(tff=self._tff).std.SelectEvery(
+            cycle=4, offsets=[1, 2]
+        )
+        processed = (
+            core.std.Interleave([src_fields, new_fields])
+            .std.SelectEvery(cycle=4, offsets=[0, 1, 3, 2])
+            .std.DoubleWeave(self._tff)[::2]
+        )
+
+        # Clean some of the artefacts caused by the above - creating a second version of the "new" fields
+        vert_median = processed.rgvs.VerticalCleaner(mode=1)
+        vert_med_diff = core.std.MakeDiff(processed, vert_median)
+        vm_new_diff1 = vert_med_diff.std.SeparateFields(tff=self._tff).std.SelectEvery(
+            cycle=4, offsets=[1, 2]
+        )
+        vm_new_diff2 = core.std.Expr(
+            [vm_new_diff1.rgvs.VerticalCleaner(mode=1), vm_new_diff1],
+            expr=f"x {self._neutral} - y {self._neutral} - * 0 < {self._neutral} x {self._neutral} - abs y {self._neutral} - abs < x y ? ?",
+        )
+        vm_new_diff3 = core.rgvs.Repair(
+            vm_new_diff2, vm_new_diff2.rgvs.RemoveGrain(mode=2), mode=1
+        )
+
+        # Reweave final result
+        return (
+            core.std.Interleave(
+                [src_fields, core.std.MakeDiff(new_fields, vm_new_diff3)]
+            )
+            .std.SelectEvery(cycle=4, offsets=[0, 1, 3, 2])
+            .std.DoubleWeave(self._tff)[::2]
+        )
 
     def _grain_restore(
         self, input: vs.VideoNode, final_noise: vs.VideoNode, strength: float
