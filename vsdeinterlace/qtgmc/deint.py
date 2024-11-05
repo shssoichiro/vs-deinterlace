@@ -1,11 +1,12 @@
 __all__ = ["QTGMC"]
 
 import math
+from dataclasses import dataclass
 
 import vapoursynth as vs
 from typing import Optional, Union, Any, Mapping
 
-from stgpytools import CustomIntEnum, fallback
+from stgpytools import fallback
 from vsaa import Nnedi3, Eedi3
 from vsdenoise import SearchMode, prefilter_to_full_range, nl_means, BM3D
 from vsexprtools import complexpr_available, norm_expr
@@ -33,6 +34,7 @@ from vsdeinterlace.qtgmc.enums import DeintMethod, DenoiseMethod, EdiMethod, Inp
 core = vs.core
 
 
+@dataclass(kw_only=True)
 class RepairSettings(dict[str, Any]):
     repair0: int
     repair1: int
@@ -40,6 +42,7 @@ class RepairSettings(dict[str, Any]):
     rep_chroma: bool
 
 
+@dataclass(kw_only=True)
 class InterpolateSettings(dict[str, Any]):
     edi_mode: EdiMethod
     nn_size: int
@@ -51,6 +54,7 @@ class InterpolateSettings(dict[str, Any]):
     eedi3_args: Mapping[str, Any]
 
 
+@dataclass(kw_only=True)
 class SharpenSettings(dict[str, Any]):
     sharpness: float
     sharp_mode: int
@@ -65,6 +69,7 @@ class SharpenSettings(dict[str, Any]):
     sharp_adj: float
 
 
+@dataclass(kw_only=True)
 class MotionEstimationSettings(dict[str, Any]):
     search_clip_pp: int
     sub_pel: int
@@ -90,6 +95,7 @@ class MotionEstimationSettings(dict[str, Any]):
     refine_motion: bool
 
 
+@dataclass(kw_only=True)
 class SourceMatchSettings(dict[str, Any]):
     source_match: int
     match_edi: EdiMethod
@@ -107,6 +113,7 @@ class SourceMatchSettings(dict[str, Any]):
     match_enhance: float
 
 
+@dataclass(kw_only=True)
 class NoiseSettings(dict[str, Any]):
     noise_process: int
     ez_denoise: float
@@ -126,6 +133,7 @@ class NoiseSettings(dict[str, Any]):
     fft_threads: int
 
 
+@dataclass(kw_only=True)
 class MotionBlurSettings(dict[str, Any]):
     shutter_blur: int
     shutter_angle_src: float
@@ -133,6 +141,7 @@ class MotionBlurSettings(dict[str, Any]):
     shutter_blur_limit: int
 
 
+@dataclass(kw_only=True)
 class QTGMCGlobals(dict[str, Any]):
     search_clip: Optional[vs.VideoNode]
     search_super: Optional[vs.VideoNode]
@@ -1115,8 +1124,8 @@ class QTGMC:
                 self.interp.num_neurons,
                 self.interp.edi_qual,
                 self.interp.edi_max_dist,
-                self.interp.chroma_edi,
                 fallback_clip=bobbed,
+                chroma_edi=self.interp.chroma_edi,
             )
 
         # InputType=2,3: use motion mask to blend luma
@@ -1856,22 +1865,22 @@ class QTGMC:
         field = 3 if self._tff else 2
 
         nnedi3_args = dict(
-            nsize=nn_size, nns=num_neurons, qual=edi_qual, **self.interp.nnedi3_args
+            field=field, nsize=nn_size, nns=num_neurons, qual=edi_qual, **self.interp.nnedi3_args
         )
-        eedi3_args = dict(mdis=edi_max_dist, **self.interp.eedi3_args)
-        nnedi3 = Nnedi3(field=field, **nnedi3_args)
-        eedi3 = Eedi3(field=field, **eedi3_args)
+        eedi3_args = dict(field=field, mdis=edi_max_dist, **self.interp.eedi3_args)
+        nnedi3 = Nnedi3(**nnedi3_args)
+        eedi3 = Eedi3(**eedi3_args)
 
         if edi_mode == EdiMethod.NNEDI3:
-            interp = nnedi3.interpolate(input, planes=planes, **nnedi3_args)
+            interp = nnedi3.interpolate(input, True, planes=planes, **nnedi3_args)
         elif edi_mode == EdiMethod.EEDI3_PLUS_NNEDI3:
             interp = eedi3.interpolate(
                 input,
-                sclip=nnedi3.interpolate(input, planes=planes, **nnedi3_args),
+                sclip=nnedi3.interpolate(input, True, planes=planes, **nnedi3_args),
                 **eedi3_args,
             )
         elif edi_mode == EdiMethod.EEDI3:
-            interp = eedi3.interpolate(input, **eedi3_args)
+            interp = eedi3.interpolate(input, True, **eedi3_args)
         elif edi_mode == EdiMethod.BWDIF:
             interp = input.bwdif.Bwdif(field=field)
         else:
@@ -1881,7 +1890,7 @@ class QTGMC:
             )
 
         if chroma_edi == EdiMethod.NNEDI3:
-            interpuv = nnedi3.interpolate(input, planes=[1, 2], nsize=4, nns=0, qual=1)
+            interpuv = nnedi3.interpolate(input, True, planes=[1, 2], nsize=4, nns=0, qual=1)
         elif chroma_edi == EdiMethod.BWDIF:
             interpuv = input.bwdif.Bwdif(field=field)
         elif chroma_edi == EdiMethod.BOB:

@@ -1,11 +1,13 @@
 __all__ = ["QTGMCPreset", "QTGMCPresets", "QTGMCNoisePreset", "QTGMCNoisePresets"]
 
+from dataclasses import dataclass
 from typing import Any
 
 from vsdenoise import SearchMode
 from vsdeinterlace.qtgmc.enums import EdiMethod, DenoiseMethod, DeintMethod
 
 
+@dataclass(kw_only=True)
 class QTGMCPreset(dict[str, Any]):
     """Base class for properties defined in a QTGMC preset"""
 
@@ -34,6 +36,32 @@ class QTGMCPreset(dict[str, Any]):
     precise: bool
     prog_sad_mask: float
 
+    @staticmethod
+    def from_int(preset: int) -> "QTGMCPreset":
+        match preset:
+            case 0:
+                return QTGMCPresets.PLACEBO
+            case 1:
+                return QTGMCPresets.VERY_SLOW
+            case 2:
+                return QTGMCPresets.SLOWER
+            case 3:
+                return QTGMCPresets.SLOW
+            case 4:
+                return QTGMCPresets.MEDIUM
+            case 5:
+                return QTGMCPresets.FAST
+            case 6:
+                return QTGMCPresets.FASTER
+            case 7:
+                return QTGMCPresets.VERY_FAST
+            case 8:
+                return QTGMCPresets.SUPER_FAST
+            case 9:
+                return QTGMCPresets.ULTRA_FAST
+            case 10:
+                return QTGMCPresets.DRAFT
+
 
 class QTGMCPresets:
     """Presets for QTGMC speed/quality tradeoff"""
@@ -42,7 +70,7 @@ class QTGMCPresets:
         preset=10,
         tr0=0,
         tr1=1,
-        tr2_x=0,
+        tr2=0,
         repair0=0,
         repair2=0,
         edi_mode=EdiMethod.BOB,
@@ -50,7 +78,7 @@ class QTGMCPresets:
         num_neurons=0,
         edi_max_dist=4,
         sharp_mode=0,
-        sharp_limit_mode_x=0,
+        sharp_limit_mode=0,
         sharp_limit_rad=1,
         sharp_back_blend=0,
         search_clip_pp=0,
@@ -69,7 +97,7 @@ class QTGMCPresets:
         preset=9,
         tr0=1,
         tr1=1,
-        tr2_x=0,
+        tr2=0,
         repair0=0,
         repair2=3,
         edi_mode=EdiMethod.BWDIF,
@@ -77,7 +105,7 @@ class QTGMCPresets:
         num_neurons=0,
         edi_max_dist=4,
         sharp_mode=2,
-        sharp_limit_mode_x=0,
+        sharp_limit_mode=0,
         sharp_limit_rad=1,
         sharp_back_blend=0,
         search_clip_pp=1,
@@ -96,7 +124,7 @@ class QTGMCPresets:
         preset=8,
         tr0=1,
         tr1=1,
-        tr2_x=0,
+        tr2=0,
         repair0=0,
         repair2=3,
         edi_mode=EdiMethod.NNEDI3,
@@ -104,7 +132,7 @@ class QTGMCPresets:
         num_neurons=0,
         edi_max_dist=4,
         sharp_mode=2,
-        sharp_limit_mode_x=0,
+        sharp_limit_mode=0,
         sharp_limit_rad=1,
         sharp_back_blend=0,
         search_clip_pp=1,
@@ -123,7 +151,7 @@ class QTGMCPresets:
         preset=7,
         tr0=1,
         tr1=1,
-        tr2_x=0,
+        tr2=0,
         repair0=0,
         repair2=4,
         edi_mode=EdiMethod.NNEDI3,
@@ -131,7 +159,7 @@ class QTGMCPresets:
         num_neurons=0,
         edi_max_dist=5,
         sharp_mode=2,
-        sharp_limit_mode_x=2,
+        sharp_limit_mode=2,
         sharp_limit_rad=1,
         sharp_back_blend=0,
         search_clip_pp=2,
@@ -150,7 +178,7 @@ class QTGMCPresets:
         preset=6,
         tr0=1,
         tr1=1,
-        tr2_x=0,
+        tr2=0,
         repair0=0,
         repair2=4,
         edi_mode=EdiMethod.NNEDI3,
@@ -158,7 +186,7 @@ class QTGMCPresets:
         num_neurons=0,
         edi_max_dist=6,
         sharp_mode=2,
-        sharp_limit_mode_x=2,
+        sharp_limit_mode=2,
         sharp_limit_rad=1,
         sharp_back_blend=0,
         search_clip_pp=2,
@@ -177,7 +205,7 @@ class QTGMCPresets:
         preset=5,
         tr0=2,
         tr1=1,
-        tr2_x=0,
+        tr2=0,
         repair0=3,
         repair2=4,
         edi_mode=EdiMethod.NNEDI3,
@@ -185,13 +213,13 @@ class QTGMCPresets:
         num_neurons=0,
         edi_max_dist=6,
         sharp_mode=2,
-        sharp_limit_mode_x=2,
+        sharp_limit_mode=2,
         sharp_limit_rad=1,
         sharp_back_blend=0,
         search_clip_pp=2,
         sub_pel=1,
         block_size=16,
-        overlap=32 // 2,
+        overlap=16 // 2,
         search=SearchMode.HEXAGON,
         search_param=2,
         pel_search=1,
@@ -204,7 +232,7 @@ class QTGMCPresets:
         preset=4,
         tr0=2,
         tr1=1,
-        tr2_x=1,
+        tr2=1,
         repair0=3,
         repair2=4,
         edi_mode=EdiMethod.NNEDI3,
@@ -212,13 +240,13 @@ class QTGMCPresets:
         num_neurons=1,
         edi_max_dist=7,
         sharp_mode=2,
-        sharp_limit_mode_x=2,
+        sharp_limit_mode=2,
         sharp_limit_rad=1,
         sharp_back_blend=0,
         search_clip_pp=3,
         sub_pel=1,
         block_size=16,
-        overlap=32 // 2,
+        overlap=16 // 2,
         search=SearchMode.HEXAGON,
         search_param=2,
         pel_search=1,
@@ -231,7 +259,7 @@ class QTGMCPresets:
         preset=3,
         tr0=2,
         tr1=1,
-        tr2_x=1,
+        tr2=1,
         repair0=4,
         repair2=4,
         edi_mode=EdiMethod.NNEDI3,
@@ -239,13 +267,13 @@ class QTGMCPresets:
         num_neurons=1,
         edi_max_dist=7,
         sharp_mode=2,
-        sharp_limit_mode_x=2,
+        sharp_limit_mode=2,
         sharp_limit_rad=1,
         sharp_back_blend=0,
         search_clip_pp=3,
         sub_pel=2,
         block_size=16,
-        overlap=32 // 2,
+        overlap=16 // 2,
         search=SearchMode.HEXAGON,
         search_param=2,
         pel_search=2,
@@ -258,7 +286,7 @@ class QTGMCPresets:
         preset=2,
         tr0=2,
         tr1=2,
-        tr2_x=1,
+        tr2=1,
         repair0=4,
         repair2=4,
         edi_mode=EdiMethod.NNEDI3,
@@ -266,13 +294,13 @@ class QTGMCPresets:
         num_neurons=1,
         edi_max_dist=8,
         sharp_mode=2,
-        sharp_limit_mode_x=2,
+        sharp_limit_mode=2,
         sharp_limit_rad=1,
         sharp_back_blend=1,
         search_clip_pp=3,
         sub_pel=2,
         block_size=16,
-        overlap=32 // 2,
+        overlap=16 // 2,
         search=SearchMode.HEXAGON,
         search_param=2,
         pel_search=2,
@@ -285,7 +313,7 @@ class QTGMCPresets:
         preset=1,
         tr0=2,
         tr1=2,
-        tr2_x=2,
+        tr2=2,
         repair0=4,
         repair2=4,
         edi_mode=EdiMethod.NNEDI3,
@@ -293,13 +321,13 @@ class QTGMCPresets:
         num_neurons=2,
         edi_max_dist=10,
         sharp_mode=2,
-        sharp_limit_mode_x=2,
+        sharp_limit_mode=2,
         sharp_limit_rad=1,
         sharp_back_blend=1,
         search_clip_pp=3,
         sub_pel=2,
         block_size=16,
-        overlap=32 // 2,
+        overlap=16 // 2,
         search=SearchMode.HEXAGON,
         search_param=2,
         pel_search=2,
@@ -312,7 +340,7 @@ class QTGMCPresets:
         preset=0,
         tr0=2,
         tr1=2,
-        tr2_x=3,
+        tr2=3,
         repair0=4,
         repair2=4,
         edi_mode=EdiMethod.NNEDI3,
@@ -320,13 +348,13 @@ class QTGMCPresets:
         num_neurons=4,
         edi_max_dist=12,
         sharp_mode=2,
-        sharp_limit_mode_x=2,
+        sharp_limit_mode=2,
         sharp_limit_rad=3,
         sharp_back_blend=3,
         search_clip_pp=3,
         sub_pel=2,
         block_size=16,
-        overlap=32 // 2,
+        overlap=16 // 2,
         search=SearchMode.UMH,
         search_param=2,
         pel_search=2,
@@ -336,6 +364,7 @@ class QTGMCPresets:
     )
 
 
+@dataclass(kw_only=True)
 class QTGMCNoisePreset(dict[str, Any]):
     """Base class for properties defined in a QTGMC noise preset"""
 
